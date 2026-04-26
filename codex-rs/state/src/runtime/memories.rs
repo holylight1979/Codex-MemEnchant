@@ -2,28 +2,399 @@ use super::threads::ThreadFilterOptions;
 use super::threads::push_thread_filters;
 use super::threads::push_thread_order_and_limit;
 use super::*;
+use crate::MemoryDirectoryHealth;
+use crate::MemoryHealthArtifact;
+use crate::MemoryHealthIssue;
+use crate::MemoryHealthReport;
+use crate::MemoryHealthRolloutSummary;
+use crate::MemoryHealthRolloutSummarySet;
+use crate::MemoryHealthSeverity;
+use crate::MemoryNegativeFeedbackReason;
+use crate::MemoryNegativeFeedbackRecord;
+use crate::MemoryNegativeFeedbackTarget;
+use crate::MemoryPeekEntry;
+use crate::MemoryRetrievalRecord;
 use crate::SortDirection;
 use crate::model::Phase2InputSelection;
 use crate::model::Phase2JobClaimOutcome;
+use crate::model::SessionValueScore;
 use crate::model::Stage1JobClaim;
 use crate::model::Stage1JobClaimOutcome;
 use crate::model::Stage1Output;
+use crate::model::Stage1OutputRef;
 use crate::model::Stage1OutputRow;
 use crate::model::Stage1StartupClaimParams;
 use crate::model::ThreadRow;
+use crate::model::memory_negative_feedback_reason_from_str;
+use crate::model::rollout_summary_file_name_from_parts;
 use crate::model::stage1_output_ref_from_parts;
+use chrono::DateTime;
 use chrono::Duration;
 use sqlx::Executor;
 use sqlx::QueryBuilder;
 use sqlx::Sqlite;
+use std::cmp::Ordering;
+use std::collections::BTreeSet;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use uuid::Uuid;
 
 const JOB_KIND_MEMORY_STAGE1: &str = "memory_stage1";
 const JOB_KIND_MEMORY_CONSOLIDATE_GLOBAL: &str = "memory_consolidate_global";
 const MEMORY_CONSOLIDATION_JOB_KEY: &str = "global";
+const DEFAULT_MEMORY_PEEK_LIMIT: usize = 10;
 
 const DEFAULT_RETRY_REMAINING: i64 = 3;
+const SESSION_VALUE_DUPLICATE_PENALTY: i64 = 18;
+
+#[derive(Debug, Clone)]
+struct SessionValueCandidate {
+    output: Stage1Output,
+    usage_count: i64,
+    last_usage: Option<DateTime<Utc>>,
+    negative_feedback_reason: Option<MemoryNegativeFeedbackReason>,
+    score: SessionValueScore,
+    fingerprint: String,
+}
+
+impl SessionValueCandidate {
+    fn recency_timestamp(&self) -> i64 {
+        self.last_usage
+            .unwrap_or(self.output.source_updated_at)
+            .timestamp()
+    }
+
+    fn from_row(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<Self> {
+        let output = Stage1Output::try_from(Stage1OutputRow::try_from_row(row)?)?;
+        let last_usage = row
+            .try_get::<Option<i64>, _>("last_usage")?
+            .map(|secs| {
+                DateTime::<Utc>::from_timestamp(secs, 0)
+                    .ok_or_else(|| anyhow::anyhow!("invalid last_usage timestamp: {secs}"))
+            })
+            .transpose()?;
+        let negative_feedback_reason = row
+            .try_get::<Option<String>, _>("negative_feedback_reason")?
+            .map(|reason| memory_negative_feedback_reason_from_str(reason.as_str()))
+            .transpose()?;
+        let usage_count = row.try_get::<Option<i64>, _>("usage_count")?.unwrap_or(0);
+        let mut candidate = Self {
+            output,
+            usage_count,
+            last_usage,
+            negative_feedback_reason,
+            score: SessionValueScore::default(),
+            fingerprint: String::new(),
+        };
+        candidate.score = compute_session_value_score(
+            &candidate.output,
+            candidate.usage_count,
+            candidate.last_usage,
+            candidate.negative_feedback_reason,
+        );
+        candidate.fingerprint = session_value_fingerprint(&candidate.output);
+        Ok(candidate)
+    }
+}
+
+#[derive(Debug, Default)]
+struct ParsedRawMemorySignals {
+    preference_bullets: Vec<String>,
+    decision_bullets: Vec<String>,
+    reusable_bullets: Vec<String>,
+    failure_bullets: Vec<String>,
+    command_path_bullets: Vec<String>,
+    successful_task_count: usize,
+}
+
+fn compute_session_value_score(
+    output: &Stage1Output,
+    usage_count: i64,
+    last_usage: Option<DateTime<Utc>>,
+    negative_feedback_reason: Option<MemoryNegativeFeedbackReason>,
+) -> SessionValueScore {
+    let signals = parse_raw_memory_signals(output.raw_memory.as_str());
+    let unique_signal_bullets = collect_unique_signal_bullets(&signals);
+    let command_path_count = count_command_or_path_signals(
+        signals
+            .command_path_bullets
+            .iter()
+            .chain(signals.reusable_bullets.iter())
+            .map(String::as_str),
+    );
+    let recovery_term_hits = count_recovery_term_hits(&signals.failure_bullets);
+    let summary_word_count = output.rollout_summary.split_whitespace().count();
+    let total_signal_bullets = signals.preference_bullets.len()
+        + signals.decision_bullets.len()
+        + signals.reusable_bullets.len()
+        + signals.failure_bullets.len()
+        + signals.command_path_bullets.len();
+
+    let novelty = (unique_signal_bullets.len().min(6) as i64) * 3;
+    let preference_decision_density =
+        ((signals.preference_bullets.len() + signals.decision_bullets.len()).min(6) as i64) * 3;
+    let reusable_command_path_signal = (command_path_count.min(5) as i64) * 3;
+    let failure_recovery_signal = ((signals.failure_bullets.len().min(3) as i64) * 3)
+        + ((recovery_term_hits.min(3) as i64) * 2);
+
+    let usage_signal = usage_count.max(0).min(3) * 4;
+    let recent_usage_signal = match last_usage.map(|value| (Utc::now() - value).num_days()) {
+        Some(days) if days <= 7 => 4,
+        Some(days) if days <= 30 => 2,
+        _ => 0,
+    };
+    let completion_citation_signal =
+        ((signals.successful_task_count.min(3) as i64) * 3) + usage_signal + recent_usage_signal;
+
+    let negative_feedback_penalty = negative_feedback_reason.map_or(0, |reason| match reason {
+        MemoryNegativeFeedbackReason::Transient => 18,
+        MemoryNegativeFeedbackReason::Duplicate => 20,
+        MemoryNegativeFeedbackReason::WrongScope => 24,
+        MemoryNegativeFeedbackReason::IncorrectInference => 28,
+        MemoryNegativeFeedbackReason::PrivacySensitive => 40,
+    });
+
+    let low_information_penalty = match (summary_word_count, total_signal_bullets) {
+        (_, 0) => 20,
+        (0..=20, _) => 12,
+        (_, 1..=2) => 8,
+        _ => 0,
+    };
+
+    let total = novelty
+        + preference_decision_density
+        + reusable_command_path_signal
+        + failure_recovery_signal
+        + completion_citation_signal
+        - negative_feedback_penalty
+        - low_information_penalty;
+
+    SessionValueScore {
+        total,
+        novelty,
+        preference_decision_density,
+        reusable_command_path_signal,
+        failure_recovery_signal,
+        completion_citation_signal,
+        negative_feedback_penalty,
+        duplication_penalty: 0,
+        low_information_penalty,
+        suppressed: negative_feedback_reason.is_some(),
+    }
+}
+
+fn parse_raw_memory_signals(raw_memory: &str) -> ParsedRawMemorySignals {
+    const PREFERENCE: &str = "Preference signals:";
+    const DECISION: &str = "Decision signals:";
+    const REUSABLE: &str = "Reusable knowledge:";
+    const FAILURE: &str = "Failures and how to do differently:";
+    const COMMAND_PATH: &str = "High-value commands or paths:";
+
+    let mut parsed = ParsedRawMemorySignals::default();
+    let mut current_section: Option<&str> = None;
+    for line in raw_memory.lines() {
+        let trimmed = line.trim();
+        if trimmed.eq_ignore_ascii_case("task_outcome: success") {
+            parsed.successful_task_count += 1;
+        }
+
+        match trimmed {
+            PREFERENCE | DECISION | REUSABLE | FAILURE | COMMAND_PATH => {
+                current_section = Some(trimmed);
+                continue;
+            }
+            _ => {}
+        }
+
+        if trimmed.starts_with("### Task ")
+            || trimmed.starts_with("task:")
+            || trimmed.starts_with("task_group:")
+            || trimmed.starts_with("task_outcome:")
+            || (trimmed.ends_with(':') && !trimmed.starts_with("- "))
+        {
+            current_section = None;
+        }
+
+        if !trimmed.starts_with("- ") {
+            continue;
+        }
+        let bullet = trimmed.trim_start_matches("- ").trim();
+        if bullet.is_empty() {
+            continue;
+        }
+
+        match current_section {
+            Some(PREFERENCE) => parsed.preference_bullets.push(bullet.to_string()),
+            Some(DECISION) => parsed.decision_bullets.push(bullet.to_string()),
+            Some(REUSABLE) => parsed.reusable_bullets.push(bullet.to_string()),
+            Some(FAILURE) => parsed.failure_bullets.push(bullet.to_string()),
+            Some(COMMAND_PATH) => parsed.command_path_bullets.push(bullet.to_string()),
+            _ => {}
+        }
+    }
+
+    parsed
+}
+
+fn collect_unique_signal_bullets(signals: &ParsedRawMemorySignals) -> HashSet<String> {
+    signals
+        .preference_bullets
+        .iter()
+        .chain(signals.decision_bullets.iter())
+        .chain(signals.reusable_bullets.iter())
+        .chain(signals.failure_bullets.iter())
+        .chain(signals.command_path_bullets.iter())
+        .map(|bullet| normalize_signal_text(bullet.as_str()))
+        .filter(|bullet| !bullet.is_empty())
+        .collect()
+}
+
+fn count_command_or_path_signals<'a>(bullets: impl Iterator<Item = &'a str>) -> usize {
+    bullets
+        .filter(|bullet| {
+            bullet.contains('`')
+                || bullet.contains('\\')
+                || bullet.contains('/')
+                || [
+                    "cargo ",
+                    "git ",
+                    "just ",
+                    "rg ",
+                    "Set-Location ",
+                    "codex",
+                    ".md",
+                ]
+                .iter()
+                .any(|needle| bullet.contains(needle))
+        })
+        .count()
+}
+
+fn count_recovery_term_hits(bullets: &[String]) -> usize {
+    bullets
+        .iter()
+        .filter(|bullet| {
+            let normalized = normalize_signal_text(bullet.as_str());
+            [
+                "avoid",
+                "instead",
+                "retry",
+                "recover",
+                "fallback",
+                "fix",
+                "correct",
+                "do differently",
+            ]
+            .iter()
+            .any(|needle| normalized.contains(needle))
+        })
+        .count()
+}
+
+fn normalize_signal_text(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn session_value_fingerprint(output: &Stage1Output) -> String {
+    let signals = parse_raw_memory_signals(output.raw_memory.as_str());
+    let mut unique_signal_bullets = collect_unique_signal_bullets(&signals)
+        .into_iter()
+        .collect::<Vec<_>>();
+    unique_signal_bullets.sort();
+
+    let normalized_summary = normalize_signal_text(output.rollout_summary.as_str());
+    let summary_fragment = normalized_summary
+        .split_whitespace()
+        .take(24)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let bullet_fragment = unique_signal_bullets
+        .into_iter()
+        .take(8)
+        .collect::<Vec<_>>()
+        .join("|");
+    format!("{summary_fragment}||{bullet_fragment}")
+}
+
+fn apply_duplicate_penalties(candidates: &mut [SessionValueCandidate]) {
+    let mut order = (0..candidates.len()).collect::<Vec<_>>();
+    order.sort_by(|lhs, rhs| compare_session_candidates_desc(&candidates[*lhs], &candidates[*rhs]));
+
+    let mut seen_fingerprints = HashMap::<String, usize>::new();
+    for idx in order {
+        let fingerprint = candidates[idx].fingerprint.trim();
+        if fingerprint.is_empty() {
+            continue;
+        }
+        let duplicate_count = seen_fingerprints
+            .entry(fingerprint.to_string())
+            .or_insert(0);
+        if *duplicate_count > 0 {
+            let penalty =
+                SESSION_VALUE_DUPLICATE_PENALTY * i64::try_from(*duplicate_count).unwrap_or(1);
+            candidates[idx].score.duplication_penalty = penalty;
+            candidates[idx].score.total -= penalty;
+        }
+        *duplicate_count += 1;
+    }
+}
+
+fn compare_session_candidates_desc(
+    lhs: &SessionValueCandidate,
+    rhs: &SessionValueCandidate,
+) -> Ordering {
+    lhs.score
+        .suppressed
+        .cmp(&rhs.score.suppressed)
+        .then_with(|| rhs.score.total.cmp(&lhs.score.total))
+        .then_with(|| rhs.usage_count.cmp(&lhs.usage_count))
+        .then_with(|| rhs.recency_timestamp().cmp(&lhs.recency_timestamp()))
+        .then_with(|| {
+            rhs.output
+                .source_updated_at
+                .cmp(&lhs.output.source_updated_at)
+        })
+        .then_with(|| {
+            rhs.output
+                .thread_id
+                .to_string()
+                .cmp(&lhs.output.thread_id.to_string())
+        })
+}
+
+fn compare_session_candidates_asc(
+    lhs: &SessionValueCandidate,
+    rhs: &SessionValueCandidate,
+) -> Ordering {
+    rhs.score
+        .suppressed
+        .cmp(&lhs.score.suppressed)
+        .then_with(|| lhs.score.total.cmp(&rhs.score.total))
+        .then_with(|| lhs.recency_timestamp().cmp(&rhs.recency_timestamp()))
+        .then_with(|| {
+            lhs.output
+                .source_updated_at
+                .cmp(&rhs.output.source_updated_at)
+        })
+        .then_with(|| {
+            lhs.output
+                .thread_id
+                .to_string()
+                .cmp(&rhs.output.thread_id.to_string())
+        })
+}
 
 impl StateRuntime {
     /// Deletes all persisted memory state in one transaction.
@@ -44,6 +415,14 @@ DELETE FROM stage1_outputs
 
         sqlx::query(
             r#"
+DELETE FROM memory_negative_feedback
+            "#,
+        )
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            r#"
 DELETE FROM jobs
 WHERE kind = ? OR kind = ?
             "#,
@@ -55,6 +434,367 @@ WHERE kind = ? OR kind = ?
 
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Lists recent stage-1 outputs in an operator-friendly shape for `memory/peek`.
+    pub async fn list_memory_peek_entries(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MemoryPeekEntry>> {
+        let limit = if limit == 0 {
+            DEFAULT_MEMORY_PEEK_LIMIT
+        } else {
+            limit
+        };
+
+        let rows = sqlx::query(
+            r#"
+SELECT
+    so.thread_id,
+    so.source_updated_at,
+    so.raw_memory,
+    so.rollout_summary,
+    so.rollout_slug,
+    so.generated_at,
+    COALESCE(t.cwd, '') AS cwd,
+    t.updated_at_ms AS thread_updated_at
+FROM stage1_outputs AS so
+LEFT JOIN threads AS t
+    ON t.id = so.thread_id
+WHERE t.memory_mode = 'enabled'
+  AND (length(trim(so.raw_memory)) > 0 OR length(trim(so.rollout_summary)) > 0)
+ORDER BY so.source_updated_at DESC, t.updated_at_ms DESC, so.thread_id DESC
+LIMIT ?
+            "#,
+        )
+        .bind(limit as i64)
+        .fetch_all(self.pool.as_ref())
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                let thread_id = ThreadId::try_from(row.try_get::<String, _>("thread_id")?)?;
+                let source_updated_at =
+                    DateTime::<Utc>::from_timestamp(row.try_get::<i64, _>("source_updated_at")?, 0)
+                        .ok_or_else(|| anyhow::anyhow!("invalid source_updated_at timestamp"))?;
+                let generated_at =
+                    DateTime::<Utc>::from_timestamp(row.try_get::<i64, _>("generated_at")?, 0)
+                        .ok_or_else(|| anyhow::anyhow!("invalid generated_at timestamp"))?;
+                let thread_updated_at =
+                    epoch_millis_to_datetime(row.try_get::<i64, _>("thread_updated_at")?)?;
+                let rollout_slug = row.try_get::<Option<String>, _>("rollout_slug")?;
+                let rollout_summary = row.try_get::<String, _>("rollout_summary")?;
+                let raw_memory = row.try_get::<String, _>("raw_memory")?;
+
+                Ok(MemoryPeekEntry {
+                    rollout_summary_file: format!(
+                        "rollout_summaries/{}",
+                        rollout_summary_file_name_from_parts(
+                            thread_id.clone(),
+                            source_updated_at,
+                            rollout_slug.as_deref(),
+                        )
+                    ),
+                    summary_excerpt: summarize_memory_peek_excerpt(
+                        rollout_summary.as_str(),
+                        raw_memory.as_str(),
+                    ),
+                    thread_id,
+                    thread_updated_at,
+                    source_updated_at,
+                    generated_at,
+                    cwd: PathBuf::from(row.try_get::<String, _>("cwd")?),
+                })
+            })
+            .collect()
+    }
+
+    /// Lists stage-1 retrieval metadata for pre-turn ranking without changing
+    /// the persisted memory schema.
+    pub async fn list_memory_retrieval_records(
+        &self,
+    ) -> anyhow::Result<Vec<MemoryRetrievalRecord>> {
+        let rows = sqlx::query(
+            r#"
+SELECT
+    so.thread_id,
+    so.source_updated_at,
+    so.rollout_slug,
+    COALESCE(t.cwd, '') AS cwd,
+    COALESCE(t.rollout_path, '') AS rollout_path,
+    COALESCE(so.usage_count, 0) AS usage_count,
+    so.last_usage,
+    mnf.reason AS negative_feedback_reason
+FROM stage1_outputs AS so
+LEFT JOIN threads AS t
+    ON t.id = so.thread_id
+LEFT JOIN memory_negative_feedback AS mnf
+    ON mnf.thread_id = so.thread_id
+   AND mnf.source_updated_at = so.source_updated_at
+WHERE t.memory_mode = 'enabled'
+  AND (length(trim(so.raw_memory)) > 0 OR length(trim(so.rollout_summary)) > 0)
+ORDER BY so.source_updated_at DESC, so.thread_id DESC
+            "#,
+        )
+        .fetch_all(self.pool.as_ref())
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                let thread_id = ThreadId::try_from(row.try_get::<String, _>("thread_id")?)?;
+                let source_updated_at =
+                    DateTime::<Utc>::from_timestamp(row.try_get::<i64, _>("source_updated_at")?, 0)
+                        .ok_or_else(|| anyhow::anyhow!("invalid source_updated_at timestamp"))?;
+                let last_usage = row
+                    .try_get::<Option<i64>, _>("last_usage")?
+                    .map(|timestamp| {
+                        DateTime::<Utc>::from_timestamp(timestamp, 0)
+                            .ok_or_else(|| anyhow::anyhow!("invalid last_usage timestamp"))
+                    })
+                    .transpose()?;
+                let negative_feedback_reason = row
+                    .try_get::<Option<String>, _>("negative_feedback_reason")?
+                    .map(|value| memory_negative_feedback_reason_from_str(&value))
+                    .transpose()?;
+
+                Ok(MemoryRetrievalRecord {
+                    thread_id,
+                    source_updated_at,
+                    rollout_slug: row.try_get::<Option<String>, _>("rollout_slug")?,
+                    cwd: PathBuf::from(row.try_get::<String, _>("cwd")?),
+                    rollout_path: PathBuf::from(row.try_get::<String, _>("rollout_path")?),
+                    usage_count: row.try_get::<i64, _>("usage_count")?,
+                    last_usage,
+                    negative_feedback_reason,
+                })
+            })
+            .collect()
+    }
+
+    /// Validates the current memory artifact layout for `memory/health`.
+    pub async fn inspect_memory_health(
+        &self,
+        max_raw_memories_for_consolidation: usize,
+        max_unused_days: i64,
+    ) -> anyhow::Result<MemoryHealthReport> {
+        let memory_root_path = self.codex_home().join("memories");
+        let rollout_summaries_dir = memory_root_path.join("rollout_summaries");
+        let selection = self
+            .get_phase2_input_selection(max_raw_memories_for_consolidation, max_unused_days)
+            .await?;
+        let has_selected_inputs = !selection.selected.is_empty();
+
+        let memory_root = collect_directory_health(memory_root_path.as_path()).await;
+        let rollout_directory = collect_directory_health(rollout_summaries_dir.as_path()).await;
+        let memory_file =
+            collect_artifact_health("memory", memory_root_path.join("MEMORY.md")).await;
+        let memory_summary_file =
+            collect_artifact_health("memory_summary", memory_root_path.join("memory_summary.md"))
+                .await;
+        let raw_memories_file =
+            collect_artifact_health("raw_memories", memory_root_path.join("raw_memories.md")).await;
+
+        let expected_rollout_files = selection
+            .selected
+            .iter()
+            .map(|item| {
+                rollout_summary_file_name_from_parts(
+                    item.thread_id,
+                    item.source_updated_at,
+                    item.rollout_slug.as_deref(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let mut expected_rollout_summaries = Vec::with_capacity(expected_rollout_files.len());
+        for file_name in &expected_rollout_files {
+            expected_rollout_summaries.push(
+                collect_rollout_summary_health(file_name, rollout_summaries_dir.join(file_name))
+                    .await,
+            );
+        }
+
+        let mut stale_rollout_summaries = Vec::new();
+        let mut malformed_retrieval_sources = Vec::new();
+        if rollout_directory.exists && rollout_directory.is_directory {
+            match tokio::fs::read_dir(&rollout_summaries_dir).await {
+                Ok(mut entries) => {
+                    let expected_names = expected_rollout_files
+                        .iter()
+                        .cloned()
+                        .collect::<BTreeSet<_>>();
+                    while let Some(entry) = entries.next_entry().await? {
+                        let path = entry.path();
+                        let file_name = entry.file_name().to_string_lossy().to_string();
+                        let file_type = entry.file_type().await?;
+                        if !file_type.is_file() {
+                            malformed_retrieval_sources.push(MemoryHealthIssue {
+                                severity: MemoryHealthSeverity::Warning,
+                                code: "malformed_retrieval_source".to_string(),
+                                message: format!(
+                                    "rollout summaries entry is not a file: {}",
+                                    path.display()
+                                ),
+                            });
+                            continue;
+                        }
+
+                        if !file_name.ends_with(".md") {
+                            malformed_retrieval_sources.push(MemoryHealthIssue {
+                                severity: MemoryHealthSeverity::Warning,
+                                code: "malformed_retrieval_source".to_string(),
+                                message: format!(
+                                    "rollout summaries entry does not use the expected .md suffix: {}",
+                                    path.display()
+                                ),
+                            });
+                            continue;
+                        }
+
+                        if expected_names.contains(&file_name) {
+                            continue;
+                        }
+
+                        stale_rollout_summaries
+                            .push(collect_rollout_summary_health(file_name.as_str(), path).await);
+                    }
+                }
+                Err(err) => {
+                    malformed_retrieval_sources.push(MemoryHealthIssue {
+                        severity: MemoryHealthSeverity::Error,
+                        code: "rollout_summaries_unreadable".to_string(),
+                        message: format!(
+                            "failed to read rollout summaries directory {}: {err}",
+                            rollout_summaries_dir.display()
+                        ),
+                    });
+                }
+            }
+        }
+
+        stale_rollout_summaries.sort_by(|left, right| left.file_name.cmp(&right.file_name));
+
+        let artifacts = vec![memory_file, memory_summary_file, raw_memories_file];
+        let mut issues = Vec::new();
+        if !memory_root.exists {
+            issues.push(MemoryHealthIssue {
+                severity: if has_selected_inputs {
+                    MemoryHealthSeverity::Error
+                } else {
+                    MemoryHealthSeverity::Warning
+                },
+                code: "missing_memory_root".to_string(),
+                message: format!("memory root is missing: {}", memory_root.path.display()),
+            });
+        } else if !memory_root.is_directory {
+            issues.push(MemoryHealthIssue {
+                severity: MemoryHealthSeverity::Error,
+                code: "invalid_memory_root".to_string(),
+                message: format!(
+                    "memory root exists but is not a directory: {}",
+                    memory_root.path.display()
+                ),
+            });
+        }
+
+        evaluate_memory_artifact_health(
+            &mut issues,
+            artifact_by_kind(&artifacts, "memory").expect("memory artifact"),
+            has_selected_inputs,
+        );
+        evaluate_memory_artifact_health(
+            &mut issues,
+            artifact_by_kind(&artifacts, "memory_summary").expect("memory_summary artifact"),
+            has_selected_inputs,
+        );
+        evaluate_memory_artifact_health(
+            &mut issues,
+            artifact_by_kind(&artifacts, "raw_memories").expect("raw_memories artifact"),
+            has_selected_inputs
+                || artifact_by_kind(&artifacts, "memory")
+                    .expect("memory artifact")
+                    .exists
+                || artifact_by_kind(&artifacts, "memory_summary")
+                    .expect("memory_summary artifact")
+                    .exists
+                || rollout_directory.exists,
+        );
+
+        if !rollout_directory.exists && has_selected_inputs {
+            issues.push(MemoryHealthIssue {
+                severity: MemoryHealthSeverity::Error,
+                code: "missing_rollout_summaries_dir".to_string(),
+                message: format!(
+                    "rollout summaries directory is missing: {}",
+                    rollout_directory.path.display()
+                ),
+            });
+        } else if rollout_directory.exists && !rollout_directory.is_directory {
+            issues.push(MemoryHealthIssue {
+                severity: MemoryHealthSeverity::Error,
+                code: "invalid_rollout_summaries_dir".to_string(),
+                message: format!(
+                    "rollout summaries path exists but is not a directory: {}",
+                    rollout_directory.path.display()
+                ),
+            });
+        }
+
+        for summary in &expected_rollout_summaries {
+            if !summary.exists {
+                issues.push(MemoryHealthIssue {
+                    severity: MemoryHealthSeverity::Error,
+                    code: "missing_rollout_summary".to_string(),
+                    message: format!(
+                        "expected rollout summary is missing: {}",
+                        summary.path.display()
+                    ),
+                });
+                continue;
+            }
+            if !summary.is_file || !summary.readable || summary.size_bytes == Some(0) {
+                issues.push(MemoryHealthIssue {
+                    severity: MemoryHealthSeverity::Error,
+                    code: "invalid_rollout_summary".to_string(),
+                    message: format!(
+                        "expected rollout summary is malformed or unreadable: {}",
+                        summary.path.display()
+                    ),
+                });
+            }
+        }
+
+        for summary in &stale_rollout_summaries {
+            issues.push(MemoryHealthIssue {
+                severity: MemoryHealthSeverity::Warning,
+                code: "stale_rollout_summary".to_string(),
+                message: format!(
+                    "rollout summary exists on disk but is not in the current phase-2 selection: {}",
+                    summary.path.display()
+                ),
+            });
+        }
+
+        issues.extend(malformed_retrieval_sources);
+        issues.sort_by(|left, right| {
+            left.code
+                .cmp(&right.code)
+                .then_with(|| left.message.cmp(&right.message))
+        });
+
+        Ok(MemoryHealthReport {
+            ok: !issues
+                .iter()
+                .any(|issue| issue.severity == MemoryHealthSeverity::Error),
+            memory_root,
+            artifacts,
+            rollout_summaries: MemoryHealthRolloutSummarySet {
+                directory: rollout_directory,
+                expected: expected_rollout_summaries,
+                stale: stale_rollout_summaries,
+            },
+            issues,
+        })
     }
 
     /// Record usage for cited stage-1 outputs.
@@ -92,6 +832,80 @@ WHERE thread_id = ?
 
         tx.commit().await?;
         Ok(updated_rows)
+    }
+
+    /// Resolves a target to the current persisted stage-1 snapshot, stores
+    /// negative feedback for that snapshot, and enqueues phase-2 forgetting.
+    pub async fn record_memory_negative_feedback(
+        &self,
+        target: &MemoryNegativeFeedbackTarget,
+        reason: MemoryNegativeFeedbackReason,
+    ) -> anyhow::Result<MemoryNegativeFeedbackRecord> {
+        let mut tx = self.pool.begin().await?;
+        let resolved_target = resolve_memory_negative_feedback_target(&mut *tx, target).await?;
+        let now = Utc::now().timestamp();
+
+        sqlx::query(
+            r#"
+INSERT INTO memory_negative_feedback (
+    thread_id,
+    source_updated_at,
+    rollout_slug,
+    reason,
+    created_at,
+    updated_at
+) VALUES (?, ?, ?, ?, ?, ?)
+ON CONFLICT(thread_id, source_updated_at) DO UPDATE SET
+    rollout_slug = excluded.rollout_slug,
+    reason = excluded.reason,
+    updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(resolved_target.thread_id.to_string())
+        .bind(resolved_target.source_updated_at.timestamp())
+        .bind(resolved_target.rollout_slug.as_deref())
+        .bind(reason.as_str())
+        .bind(now)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+
+        enqueue_global_consolidation_with_executor(
+            &mut *tx,
+            resolved_target.source_updated_at.timestamp(),
+        )
+        .await?;
+
+        let row = sqlx::query(
+            r#"
+SELECT thread_id, source_updated_at, rollout_slug, reason, created_at, updated_at
+FROM memory_negative_feedback
+WHERE thread_id = ? AND source_updated_at = ?
+            "#,
+        )
+        .bind(resolved_target.thread_id.to_string())
+        .bind(resolved_target.source_updated_at.timestamp())
+        .fetch_one(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+
+        Ok(MemoryNegativeFeedbackRecord {
+            thread_id: ThreadId::try_from(row.try_get::<String, _>("thread_id")?)?,
+            source_updated_at: DateTime::<Utc>::from_timestamp(
+                row.try_get::<i64, _>("source_updated_at")?,
+                0,
+            )
+            .ok_or_else(|| anyhow::anyhow!("invalid memory negative feedback source_updated_at"))?,
+            rollout_slug: row.try_get("rollout_slug")?,
+            reason: memory_negative_feedback_reason_from_str(
+                row.try_get::<String, _>("reason")?.as_str(),
+            )?,
+            created_at: DateTime::<Utc>::from_timestamp(row.try_get::<i64, _>("created_at")?, 0)
+                .ok_or_else(|| anyhow::anyhow!("invalid memory negative feedback created_at"))?,
+            updated_at: DateTime::<Utc>::from_timestamp(row.try_get::<i64, _>("updated_at")?, 0)
+                .ok_or_else(|| anyhow::anyhow!("invalid memory negative feedback updated_at"))?,
+        })
     }
 
     /// Selects and claims stage-1 startup jobs for stale threads.
@@ -295,7 +1109,9 @@ LIMIT ?
     /// - considers only rows with `selected_for_phase2 = 0`
     /// - keeps recency as `COALESCE(last_usage, source_updated_at)`
     /// - removes rows older than `max_unused_days`
-    /// - prunes at most `limit` rows ordered from stalest to newest
+    /// - computes a deterministic session-value score for each stale row and
+    ///   prunes at most `limit` rows ordered from lowest-value to highest-value
+    ///   with stale recency as a tie-breaker
     pub async fn prune_stage1_outputs_for_retention(
         &self,
         max_unused_days: i64,
@@ -306,27 +1122,62 @@ LIMIT ?
         }
 
         let cutoff = (Utc::now() - Duration::days(max_unused_days.max(0))).timestamp();
-        let rows_affected = sqlx::query(
+        let rows = sqlx::query(
             r#"
-DELETE FROM stage1_outputs
-WHERE thread_id IN (
-    SELECT thread_id
-    FROM stage1_outputs
-    WHERE selected_for_phase2 = 0
-      AND COALESCE(last_usage, source_updated_at) < ?
-    ORDER BY
-      COALESCE(last_usage, source_updated_at) ASC,
-      source_updated_at ASC,
-      thread_id ASC
-    LIMIT ?
-)
+SELECT
+    so.thread_id,
+    COALESCE(t.rollout_path, '') AS rollout_path,
+    so.source_updated_at,
+    so.raw_memory,
+    so.rollout_summary,
+    so.rollout_slug,
+    so.generated_at,
+    COALESCE(t.cwd, '') AS cwd,
+    t.git_branch AS git_branch,
+    COALESCE(so.usage_count, 0) AS usage_count,
+    so.last_usage,
+    mnf.reason AS negative_feedback_reason
+FROM stage1_outputs AS so
+LEFT JOIN threads AS t
+    ON t.id = so.thread_id
+LEFT JOIN memory_negative_feedback AS mnf
+    ON mnf.thread_id = so.thread_id
+   AND mnf.source_updated_at = so.source_updated_at
+WHERE so.selected_for_phase2 = 0
+  AND COALESCE(so.last_usage, so.source_updated_at) < ?
             "#,
         )
         .bind(cutoff)
-        .bind(limit as i64)
-        .execute(self.pool.as_ref())
+        .fetch_all(self.pool.as_ref())
         .await?
-        .rows_affected();
+        .into_iter()
+        .map(|row| SessionValueCandidate::from_row(&row))
+        .collect::<Result<Vec<_>, _>>()?;
+
+        let mut candidates = rows;
+        apply_duplicate_penalties(&mut candidates);
+        candidates.sort_by(compare_session_candidates_asc);
+        let thread_ids = candidates
+            .into_iter()
+            .take(limit)
+            .map(|candidate| candidate.output.thread_id.to_string())
+            .collect::<Vec<_>>();
+        if thread_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let mut builder =
+            QueryBuilder::<Sqlite>::new("DELETE FROM stage1_outputs WHERE thread_id IN (");
+        let mut separated = builder.separated(", ");
+        for thread_id in &thread_ids {
+            separated.push_bind(thread_id);
+        }
+        separated.push_unseparated(")");
+        let rows_affected = builder
+            .build()
+            .execute(self.pool.as_ref())
+            .await?
+            .rows_affected();
 
         Ok(rows_affected as usize)
     }
@@ -339,9 +1190,10 @@ WHERE thread_id IN (
     ///   `last_usage` is within `max_unused_days`, or whose
     ///   `source_updated_at` is within that window when the memory has never
     ///   been used
-    /// - eligible rows are ordered by `usage_count DESC`,
-    ///   `COALESCE(last_usage, source_updated_at) DESC`, `source_updated_at DESC`,
-    ///   `thread_id DESC`
+    /// - eligible rows are scored deterministically using structured Phase-1
+    ///   content plus usage / suppression metadata
+    /// - current selection is ordered by session-value score DESC, then by
+    ///   usage / recency tie-breakers
     /// - previously selected rows are identified by `selected_for_phase2 = 1`
     /// - `previous_selected` contains the current persisted rows that belonged
     ///   to the last successful phase-2 baseline, even if those threads are no
@@ -373,47 +1225,74 @@ SELECT
     so.generated_at,
     COALESCE(t.cwd, '') AS cwd,
     t.git_branch AS git_branch,
+    COALESCE(so.usage_count, 0) AS usage_count,
+    so.last_usage,
+    mnf.reason AS negative_feedback_reason,
     so.selected_for_phase2,
     so.selected_for_phase2_source_updated_at
 FROM stage1_outputs AS so
 LEFT JOIN threads AS t
     ON t.id = so.thread_id
+LEFT JOIN memory_negative_feedback AS mnf
+    ON mnf.thread_id = so.thread_id
+   AND mnf.source_updated_at = so.source_updated_at
 WHERE t.memory_mode = 'enabled'
   AND (length(trim(so.raw_memory)) > 0 OR length(trim(so.rollout_summary)) > 0)
   AND (
         (so.last_usage IS NOT NULL AND so.last_usage >= ?)
         OR (so.last_usage IS NULL AND so.source_updated_at >= ?)
   )
-ORDER BY
-    COALESCE(so.usage_count, 0) DESC,
-    COALESCE(so.last_usage, so.source_updated_at) DESC,
-    so.source_updated_at DESC,
-    so.thread_id DESC
-LIMIT ?
             "#,
         )
         .bind(cutoff)
         .bind(cutoff)
-        .bind(n as i64)
         .fetch_all(self.pool.as_ref())
         .await?;
 
-        let mut current_thread_ids = HashSet::with_capacity(current_rows.len());
-        let mut selected = Vec::with_capacity(current_rows.len());
+        let mut current_candidates = current_rows
+            .into_iter()
+            .map(|row| {
+                let selected_for_phase2 = row.try_get::<i64, _>("selected_for_phase2")? != 0;
+                let selected_for_phase2_source_updated_at =
+                    row.try_get::<Option<i64>, _>("selected_for_phase2_source_updated_at")?;
+                let candidate = SessionValueCandidate::from_row(&row)?;
+                Ok((
+                    candidate,
+                    selected_for_phase2,
+                    selected_for_phase2_source_updated_at,
+                ))
+            })
+            .collect::<Result<Vec<_>, anyhow::Error>>()?;
+        let mut scored_candidates = current_candidates
+            .iter()
+            .map(|(candidate, _, _)| candidate.clone())
+            .collect::<Vec<_>>();
+        apply_duplicate_penalties(&mut scored_candidates);
+        for ((candidate, _, _), scored_candidate) in current_candidates
+            .iter_mut()
+            .zip(scored_candidates.into_iter())
+        {
+            *candidate = scored_candidate;
+        }
+        current_candidates.sort_by(|lhs, rhs| compare_session_candidates_desc(&lhs.0, &rhs.0));
+
+        let mut current_thread_ids = HashSet::with_capacity(current_candidates.len());
+        let mut selected = Vec::with_capacity(current_candidates.len().min(n));
         let mut retained_thread_ids = Vec::new();
-        for row in current_rows {
-            let thread_id = row.try_get::<String, _>("thread_id")?;
-            current_thread_ids.insert(thread_id.clone());
-            let source_updated_at = row.try_get::<i64, _>("source_updated_at")?;
-            if row.try_get::<i64, _>("selected_for_phase2")? != 0
-                && row.try_get::<Option<i64>, _>("selected_for_phase2_source_updated_at")?
-                    == Some(source_updated_at)
+        for (candidate, selected_for_phase2, selected_for_phase2_source_updated_at) in
+            current_candidates
+                .into_iter()
+                .filter(|(candidate, _, _)| !candidate.score.suppressed)
+                .take(n)
+        {
+            current_thread_ids.insert(candidate.output.thread_id.to_string());
+            let source_updated_at = candidate.output.source_updated_at.timestamp();
+            if selected_for_phase2
+                && selected_for_phase2_source_updated_at == Some(source_updated_at)
             {
-                retained_thread_ids.push(ThreadId::try_from(thread_id.clone())?);
+                retained_thread_ids.push(candidate.output.thread_id.clone());
             }
-            selected.push(Stage1Output::try_from(Stage1OutputRow::try_from_row(
-                &row,
-            )?)?);
+            selected.push(candidate.output);
         }
 
         let previous_rows = sqlx::query(
@@ -1218,6 +2097,131 @@ WHERE kind = ? AND job_key = ?
     }
 }
 
+fn summarize_memory_peek_excerpt(rollout_summary: &str, raw_memory: &str) -> String {
+    const MAX_CHARS: usize = 220;
+
+    let source = if rollout_summary.trim().is_empty() {
+        raw_memory
+    } else {
+        rollout_summary
+    };
+    let normalized = source.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.chars().count() <= MAX_CHARS {
+        return normalized;
+    }
+
+    let truncated = normalized
+        .chars()
+        .take(MAX_CHARS.saturating_sub(3))
+        .collect::<String>();
+    format!("{truncated}...")
+}
+
+async fn collect_directory_health(path: &Path) -> MemoryDirectoryHealth {
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) => MemoryDirectoryHealth {
+            path: path.to_path_buf(),
+            exists: true,
+            is_directory: metadata.is_dir(),
+        },
+        Err(_) => MemoryDirectoryHealth {
+            path: path.to_path_buf(),
+            exists: false,
+            is_directory: false,
+        },
+    }
+}
+
+async fn collect_artifact_health(kind: &str, path: PathBuf) -> MemoryHealthArtifact {
+    let (exists, is_file, size_bytes) = match tokio::fs::symlink_metadata(&path).await {
+        Ok(metadata) => (true, metadata.is_file(), Some(metadata.len())),
+        Err(_) => (false, false, None),
+    };
+    let readable = if exists && is_file {
+        tokio::fs::read(&path).await.is_ok()
+    } else {
+        false
+    };
+
+    MemoryHealthArtifact {
+        kind: kind.to_string(),
+        path,
+        exists,
+        is_file,
+        readable,
+        size_bytes,
+    }
+}
+
+async fn collect_rollout_summary_health(
+    file_name: &str,
+    path: PathBuf,
+) -> MemoryHealthRolloutSummary {
+    let artifact = collect_artifact_health("rollout_summary", path.clone()).await;
+    MemoryHealthRolloutSummary {
+        file_name: file_name.to_string(),
+        path,
+        exists: artifact.exists,
+        is_file: artifact.is_file,
+        readable: artifact.readable,
+        size_bytes: artifact.size_bytes,
+    }
+}
+
+fn artifact_by_kind<'a>(
+    artifacts: &'a [MemoryHealthArtifact],
+    kind: &str,
+) -> Option<&'a MemoryHealthArtifact> {
+    artifacts.iter().find(|artifact| artifact.kind == kind)
+}
+
+fn evaluate_memory_artifact_health(
+    issues: &mut Vec<MemoryHealthIssue>,
+    artifact: &MemoryHealthArtifact,
+    expected: bool,
+) {
+    if !artifact.exists {
+        if expected {
+            issues.push(MemoryHealthIssue {
+                severity: MemoryHealthSeverity::Error,
+                code: format!("missing_{}", artifact.kind),
+                message: format!(
+                    "expected memory artifact is missing: {}",
+                    artifact.path.display()
+                ),
+            });
+        }
+        return;
+    }
+
+    if !artifact.is_file || !artifact.readable || artifact.size_bytes == Some(0) {
+        issues.push(MemoryHealthIssue {
+            severity: if expected {
+                MemoryHealthSeverity::Error
+            } else {
+                MemoryHealthSeverity::Warning
+            },
+            code: format!("invalid_{}", artifact.kind),
+            message: format!(
+                "memory artifact is malformed or unreadable: {}",
+                artifact.path.display()
+            ),
+        });
+        return;
+    }
+
+    if !expected && artifact.kind != "raw_memories" {
+        issues.push(MemoryHealthIssue {
+            severity: MemoryHealthSeverity::Warning,
+            code: format!("stale_{}", artifact.kind),
+            message: format!(
+                "memory artifact exists on disk but no current phase-2 input requires it: {}",
+                artifact.path.display()
+            ),
+        });
+    }
+}
+
 async fn enqueue_global_consolidation_with_executor<'e, E>(
     executor: E,
     input_watermark: i64,
@@ -1269,6 +2273,65 @@ ON CONFLICT(kind, job_key) DO UPDATE SET
     Ok(())
 }
 
+async fn resolve_memory_negative_feedback_target<'e, E>(
+    executor: E,
+    target: &MemoryNegativeFeedbackTarget,
+) -> anyhow::Result<Stage1OutputRef>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    let row = if let Some(source_updated_at) = target.source_updated_at {
+        sqlx::query(
+            r#"
+SELECT thread_id, source_updated_at, rollout_slug
+FROM stage1_outputs
+WHERE thread_id = ? AND source_updated_at = ?
+            "#,
+        )
+        .bind(target.thread_id.to_string())
+        .bind(source_updated_at.timestamp())
+        .fetch_optional(executor)
+        .await?
+    } else {
+        sqlx::query(
+            r#"
+SELECT thread_id, source_updated_at, rollout_slug
+FROM stage1_outputs
+WHERE thread_id = ?
+            "#,
+        )
+        .bind(target.thread_id.to_string())
+        .fetch_optional(executor)
+        .await?
+    };
+
+    let Some(row) = row else {
+        anyhow::bail!(
+            "no persisted stage-1 output found for thread {}",
+            target.thread_id
+        );
+    };
+
+    let resolved = stage1_output_ref_from_parts(
+        row.try_get::<String, _>("thread_id")?,
+        row.try_get::<i64, _>("source_updated_at")?,
+        row.try_get::<Option<String>, _>("rollout_slug")?,
+    )?;
+
+    if let Some(expected_rollout_slug) = target.rollout_slug.as_deref()
+        && resolved.rollout_slug.as_deref() != Some(expected_rollout_slug)
+    {
+        anyhow::bail!(
+            "rollout slug mismatch for thread {}: expected {:?}, found {:?}",
+            target.thread_id,
+            expected_rollout_slug,
+            resolved.rollout_slug
+        );
+    }
+
+    Ok(resolved)
+}
+
 #[cfg(test)]
 mod tests {
     use super::JOB_KIND_MEMORY_CONSOLIDATE_GLOBAL;
@@ -1276,14 +2339,20 @@ mod tests {
     use super::StateRuntime;
     use super::test_support::test_thread_metadata;
     use super::test_support::unique_temp_dir;
+    use crate::MemoryHealthSeverity;
+    use crate::MemoryNegativeFeedbackReason;
+    use crate::MemoryNegativeFeedbackTarget;
     use crate::model::Phase2JobClaimOutcome;
     use crate::model::Stage1JobClaimOutcome;
     use crate::model::Stage1StartupClaimParams;
+    use crate::model::rollout_summary_file_name_from_parts;
     use chrono::Duration;
+    use chrono::TimeZone;
     use chrono::Utc;
     use codex_protocol::ThreadId;
     use pretty_assertions::assert_eq;
     use sqlx::Row;
+    use std::path::Path;
     use std::sync::Arc;
     use uuid::Uuid;
 
@@ -1861,6 +2930,17 @@ mod tests {
             .enqueue_global_consolidation(enabled.updated_at.timestamp())
             .await
             .expect("enqueue global consolidation");
+        runtime
+            .record_memory_negative_feedback(
+                &MemoryNegativeFeedbackTarget {
+                    thread_id: enabled_thread_id,
+                    source_updated_at: Some(enabled.updated_at),
+                    rollout_slug: None,
+                },
+                MemoryNegativeFeedbackReason::Transient,
+            )
+            .await
+            .expect("record negative feedback");
 
         let mut disabled =
             test_thread_metadata(&codex_home, disabled_thread_id, codex_home.join("disabled"));
@@ -1895,6 +2975,13 @@ mod tests {
                 .await
                 .expect("count memory jobs");
         assert_eq!(memory_jobs_count, 0);
+
+        let negative_feedback_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM memory_negative_feedback")
+                .fetch_one(runtime.pool.as_ref())
+                .await
+                .expect("count memory negative feedback");
+        assert_eq!(negative_feedback_count, 0);
 
         let enabled_memory_mode: String =
             sqlx::query_scalar("SELECT memory_mode FROM threads WHERE id = ?")
@@ -3784,6 +4871,138 @@ VALUES (?, ?, ?, ?, ?)
     }
 
     #[tokio::test]
+    async fn record_memory_negative_feedback_suppresses_current_snapshot_from_phase2_selection() {
+        let codex_home = unique_temp_dir();
+        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
+            .await
+            .expect("initialize runtime");
+
+        let owner = ThreadId::from_string(&Uuid::new_v4().to_string()).expect("owner id");
+        let thread_a = ThreadId::from_string(&Uuid::new_v4().to_string()).expect("thread id a");
+        let thread_b = ThreadId::from_string(&Uuid::new_v4().to_string()).expect("thread id b");
+
+        for (thread_id, workspace) in [(thread_a, "workspace-a"), (thread_b, "workspace-b")] {
+            runtime
+                .upsert_thread(&test_thread_metadata(
+                    &codex_home,
+                    thread_id,
+                    codex_home.join(workspace),
+                ))
+                .await
+                .expect("upsert thread");
+        }
+
+        for (thread_id, source_updated_at, rollout_slug, summary) in [
+            (thread_a, 100_i64, Some("a"), "summary-a"),
+            (thread_b, 101_i64, Some("b"), "summary-b"),
+        ] {
+            let claim = runtime
+                .try_claim_stage1_job(
+                    thread_id,
+                    owner,
+                    source_updated_at,
+                    /*lease_seconds*/ 3600,
+                    /*max_running_jobs*/ 64,
+                )
+                .await
+                .expect("claim stage1");
+            let ownership_token = match claim {
+                Stage1JobClaimOutcome::Claimed { ownership_token } => ownership_token,
+                other => panic!("unexpected stage1 claim outcome: {other:?}"),
+            };
+            assert!(
+                runtime
+                    .mark_stage1_job_succeeded(
+                        thread_id,
+                        ownership_token.as_str(),
+                        source_updated_at,
+                        &format!("raw-{summary}"),
+                        summary,
+                        rollout_slug,
+                    )
+                    .await
+                    .expect("mark stage1 success"),
+                "stage1 success should persist output"
+            );
+        }
+
+        let initial_selection = runtime
+            .get_phase2_input_selection(/*n*/ 2, /*max_unused_days*/ 36_500)
+            .await
+            .expect("load initial phase2 selection");
+        assert_eq!(initial_selection.selected.len(), 2);
+
+        let phase2_claim = runtime
+            .try_claim_global_phase2_job(owner, /*lease_seconds*/ 3_600)
+            .await
+            .expect("claim initial phase2");
+        let (phase2_token, input_watermark) = match phase2_claim {
+            Phase2JobClaimOutcome::Claimed {
+                ownership_token,
+                input_watermark,
+            } => (ownership_token, input_watermark),
+            other => panic!("unexpected initial phase2 claim outcome: {other:?}"),
+        };
+        assert!(
+            runtime
+                .mark_global_phase2_job_succeeded(
+                    phase2_token.as_str(),
+                    input_watermark,
+                    &initial_selection.selected,
+                )
+                .await
+                .expect("mark initial phase2 success"),
+            "initial phase2 success should finalize"
+        );
+
+        let feedback = runtime
+            .record_memory_negative_feedback(
+                &MemoryNegativeFeedbackTarget {
+                    thread_id: thread_a,
+                    source_updated_at: None,
+                    rollout_slug: Some("a".to_string()),
+                },
+                MemoryNegativeFeedbackReason::WrongScope,
+            )
+            .await
+            .expect("record memory negative feedback");
+        assert_eq!(feedback.thread_id, thread_a);
+        assert_eq!(feedback.source_updated_at.timestamp(), 100);
+        assert_eq!(feedback.reason, MemoryNegativeFeedbackReason::WrongScope);
+
+        let feedback_reason: String = sqlx::query_scalar(
+            "SELECT reason FROM memory_negative_feedback WHERE thread_id = ? AND source_updated_at = ?",
+        )
+        .bind(thread_a.to_string())
+        .bind(100_i64)
+        .fetch_one(runtime.pool.as_ref())
+        .await
+        .expect("load memory negative feedback reason");
+        assert_eq!(feedback_reason, "wrong_scope");
+
+        let selection = runtime
+            .get_phase2_input_selection(/*n*/ 2, /*max_unused_days*/ 36_500)
+            .await
+            .expect("load phase2 selection after suppression");
+        assert_eq!(selection.selected.len(), 1);
+        assert_eq!(selection.selected[0].thread_id, thread_b);
+        assert_eq!(selection.previous_selected.len(), 2);
+        assert_eq!(selection.removed.len(), 1);
+        assert_eq!(selection.removed[0].thread_id, thread_a);
+
+        let claim_after_feedback = runtime
+            .try_claim_global_phase2_job(owner, /*lease_seconds*/ 3_600)
+            .await
+            .expect("claim phase2 after feedback");
+        assert!(
+            matches!(claim_after_feedback, Phase2JobClaimOutcome::Claimed { .. }),
+            "negative feedback should enqueue a fresh phase2 run"
+        );
+
+        let _ = tokio::fs::remove_dir_all(codex_home).await;
+    }
+
+    #[tokio::test]
     async fn get_phase2_input_selection_prioritizes_usage_count_then_recent_usage() {
         let codex_home = unique_temp_dir();
         let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
@@ -4059,6 +5278,196 @@ VALUES (?, ?, ?, ?, ?)
         assert_eq!(selection.selected.len(), 1);
         assert_eq!(selection.selected[0].thread_id, newer_thread);
         assert_eq!(selection.selected[0].source_updated_at.timestamp(), 200);
+
+        let _ = tokio::fs::remove_dir_all(codex_home).await;
+    }
+
+    #[tokio::test]
+    async fn get_phase2_input_selection_prefers_high_value_session_over_newer_low_information_session()
+     {
+        let codex_home = unique_temp_dir();
+        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
+            .await
+            .expect("initialize runtime");
+
+        let owner = ThreadId::from_string(&Uuid::new_v4().to_string()).expect("owner id");
+        let high_value_raw_memory = high_value_raw_memory(
+            "cargo test -p codex-state memory_session_value_scoring",
+            "codex-rs/state/src/runtime/memories.rs",
+        );
+        let high_value_thread = seed_stage1_output_with_raw_memory(
+            &runtime,
+            codex_home.as_path(),
+            owner,
+            "workspace-high",
+            1_710_000_100,
+            high_value_raw_memory.as_str(),
+            "Session value scoring preserved a deterministic recovery pattern and reusable command path guidance.",
+            Some("high-value"),
+        )
+        .await;
+        let low_value_thread = seed_stage1_output_with_raw_memory(
+            &runtime,
+            codex_home.as_path(),
+            owner,
+            "workspace-low",
+            1_710_000_300,
+            low_information_raw_memory(),
+            "Short note.",
+            Some("low-info"),
+        )
+        .await;
+
+        let selection = runtime
+            .get_phase2_input_selection(/*n*/ 1, /*max_unused_days*/ 36_500)
+            .await
+            .expect("load phase2 input selection");
+
+        assert_eq!(selection.selected.len(), 1);
+        assert_eq!(selection.selected[0].thread_id, high_value_thread);
+        assert_ne!(selection.selected[0].thread_id, low_value_thread);
+
+        let _ = tokio::fs::remove_dir_all(codex_home).await;
+    }
+
+    #[tokio::test]
+    async fn get_phase2_input_selection_demotes_duplicate_session_below_unique_medium_value_session()
+     {
+        let codex_home = unique_temp_dir();
+        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
+            .await
+            .expect("initialize runtime");
+
+        let owner = ThreadId::from_string(&Uuid::new_v4().to_string()).expect("owner id");
+        let duplicate_raw_memory = high_value_raw_memory(
+            "cargo test -p codex-state memory_session_value_scoring",
+            "codex-rs/state/src/model/memories.rs",
+        );
+        let medium_raw_memory = medium_value_raw_memory("cargo build -p codex-cli");
+        let canonical = seed_stage1_output_with_raw_memory(
+            &runtime,
+            codex_home.as_path(),
+            owner,
+            "workspace-canonical",
+            1_710_000_100,
+            duplicate_raw_memory.as_str(),
+            "Session value scoring preserved a deterministic recovery pattern and reusable command path guidance.",
+            Some("canonical"),
+        )
+        .await;
+        let duplicate = seed_stage1_output_with_raw_memory(
+            &runtime,
+            codex_home.as_path(),
+            owner,
+            "workspace-duplicate",
+            1_710_000_090,
+            duplicate_raw_memory.as_str(),
+            "Session value scoring preserved a deterministic recovery pattern and reusable command path guidance.",
+            Some("duplicate"),
+        )
+        .await;
+        let medium = seed_stage1_output_with_raw_memory(
+            &runtime,
+            codex_home.as_path(),
+            owner,
+            "workspace-medium",
+            1_710_000_080,
+            medium_raw_memory.as_str(),
+            "Runtime scoring stayed heuristic but still produced a reusable command note with enough context for later consolidation.",
+            Some("medium"),
+        )
+        .await;
+
+        sqlx::query(
+            "UPDATE stage1_outputs SET usage_count = ?, last_usage = ? WHERE thread_id = ?",
+        )
+        .bind(2_i64)
+        .bind((Utc::now() - Duration::days(1)).timestamp())
+        .bind(medium.to_string())
+        .execute(runtime.pool.as_ref())
+        .await
+        .expect("update medium usage metadata");
+
+        let selection = runtime
+            .get_phase2_input_selection(/*n*/ 2, /*max_unused_days*/ 36_500)
+            .await
+            .expect("load phase2 input selection");
+
+        assert_eq!(
+            selection
+                .selected
+                .iter()
+                .map(|output| output.thread_id)
+                .collect::<Vec<_>>(),
+            vec![canonical, medium]
+        );
+        assert!(
+            !selection
+                .selected
+                .iter()
+                .any(|output| output.thread_id == duplicate),
+            "duplicate session should be demoted below the unique medium-value session"
+        );
+
+        let _ = tokio::fs::remove_dir_all(codex_home).await;
+    }
+
+    #[tokio::test]
+    async fn prune_stage1_outputs_for_retention_prefers_pruning_low_value_before_older_high_value()
+    {
+        let codex_home = unique_temp_dir();
+        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
+            .await
+            .expect("initialize runtime");
+
+        let owner = ThreadId::from_string(&Uuid::new_v4().to_string()).expect("owner id");
+        let now = Utc::now();
+        let prune_high_value_raw_memory = high_value_raw_memory(
+            "cargo test -p codex-state prune_stage1_outputs_for_retention",
+            "codex-rs/state/src/runtime/memories.rs",
+        );
+        let high_value_thread = seed_stage1_output_with_raw_memory(
+            &runtime,
+            codex_home.as_path(),
+            owner,
+            "workspace-high-prune",
+            (now - Duration::days(60)).timestamp(),
+            prune_high_value_raw_memory.as_str(),
+            "Older but high-value summary with reusable command and recovery guidance.",
+            Some("high-prune"),
+        )
+        .await;
+        let low_value_thread = seed_stage1_output_with_raw_memory(
+            &runtime,
+            codex_home.as_path(),
+            owner,
+            "workspace-low-prune",
+            (now - Duration::days(40)).timestamp(),
+            low_information_raw_memory(),
+            "Short note.",
+            Some("low-prune"),
+        )
+        .await;
+
+        let pruned = runtime
+            .prune_stage1_outputs_for_retention(/*max_unused_days*/ 30, /*limit*/ 1)
+            .await
+            .expect("prune stage1 outputs with value score");
+        assert_eq!(pruned, 1);
+
+        let remaining = sqlx::query_scalar::<_, String>(
+            "SELECT thread_id FROM stage1_outputs ORDER BY thread_id",
+        )
+        .fetch_all(runtime.pool.as_ref())
+        .await
+        .expect("load remaining stage1 outputs after score-based prune");
+        assert_eq!(remaining, vec![high_value_thread.to_string()]);
+        assert!(
+            !remaining
+                .iter()
+                .any(|thread_id| thread_id == &low_value_thread.to_string()),
+            "low-information stale session should be pruned before the older high-value session"
+        );
 
         let _ = tokio::fs::remove_dir_all(codex_home).await;
     }
@@ -4609,6 +6018,389 @@ VALUES (?, ?, ?, ?, ?)
             .await
             .expect("claim after fallback failure");
         assert_eq!(claim, Phase2JobClaimOutcome::SkippedNotDirty);
+
+        let _ = tokio::fs::remove_dir_all(codex_home).await;
+    }
+
+    async fn seed_stage1_output(
+        runtime: &Arc<StateRuntime>,
+        codex_home: &Path,
+        owner: ThreadId,
+        workspace: &str,
+        source_updated_at: i64,
+        rollout_summary: &str,
+        rollout_slug: Option<&str>,
+    ) -> ThreadId {
+        seed_stage1_output_with_raw_memory(
+            runtime,
+            codex_home,
+            owner,
+            workspace,
+            source_updated_at,
+            "raw memory body",
+            rollout_summary,
+            rollout_slug,
+        )
+        .await
+    }
+
+    async fn seed_stage1_output_with_raw_memory(
+        runtime: &Arc<StateRuntime>,
+        codex_home: &Path,
+        owner: ThreadId,
+        workspace: &str,
+        source_updated_at: i64,
+        raw_memory: &str,
+        rollout_summary: &str,
+        rollout_slug: Option<&str>,
+    ) -> ThreadId {
+        let thread_id = ThreadId::from_string(&Uuid::new_v4().to_string()).expect("thread id");
+        let mut metadata = test_thread_metadata(codex_home, thread_id, codex_home.join(workspace));
+        metadata.updated_at = Utc
+            .timestamp_opt(source_updated_at + 60, 0)
+            .single()
+            .expect("updated_at timestamp");
+        runtime
+            .upsert_thread(&metadata)
+            .await
+            .expect("upsert thread");
+
+        let claim = runtime
+            .try_claim_stage1_job(
+                thread_id,
+                owner,
+                source_updated_at,
+                /*lease_seconds*/ 3_600,
+                /*max_running_jobs*/ 64,
+            )
+            .await
+            .expect("claim stage1 job");
+        let Stage1JobClaimOutcome::Claimed { ownership_token } = claim else {
+            panic!("unexpected stage1 claim outcome: {claim:?}");
+        };
+        assert!(
+            runtime
+                .mark_stage1_job_succeeded(
+                    thread_id,
+                    ownership_token.as_str(),
+                    source_updated_at,
+                    raw_memory,
+                    rollout_summary,
+                    rollout_slug,
+                )
+                .await
+                .expect("mark stage1 success"),
+            "stage1 success should persist output"
+        );
+        thread_id
+    }
+
+    fn high_value_raw_memory(command: &str, path: &str) -> String {
+        format!(
+            "\
+---
+description: High-value memory scoring signal
+task: high-value-memory
+task_group: memory
+keywords: memory, scoring, preference, command, recovery
+---
+
+### Task 1: Build session value scoring
+task: build-session-value-scoring
+task_group: memory
+task_outcome: success
+
+Preference signals:
+- prefer deterministic, explainable scoring over opaque heuristics
+- keep schema changes minimal when the same signal can be derived from current state
+
+Decision signals:
+- make the score influence phase2 selection order directly instead of storing it as debug metadata only
+- use the same score to bias retention decisions so low-value sessions are pruned first
+
+Scope and cwd notes:
+- primary cwd is `C:\\CodexSource\\codex`; keep the score scoped to the current Codex checkout
+
+Reusable knowledge:
+- parse the structured Phase 1 sections to recover durable preference, decision, and command signals
+- keep duplicate sessions from crowding out unique sessions during consolidation
+
+Failures and how to do differently:
+- when low-information sessions are newer than richer sessions, do not let recency alone dominate selection
+- if a session is duplicated, preserve one canonical copy and penalize the rest instead of promoting every clone
+
+High-value commands or paths:
+- `{command}`
+- `{path}`
+"
+        )
+    }
+
+    fn medium_value_raw_memory(command: &str) -> String {
+        format!(
+            "\
+---
+description: Medium-value memory scoring signal
+task: medium-value-memory
+task_group: memory
+keywords: memory, scoring, command
+---
+
+### Task 1: Keep a reusable command note
+task: keep-reusable-command-note
+task_group: memory
+task_outcome: success
+
+Preference signals:
+- prefer small, targeted runtime changes before broader memory UI work
+
+Decision signals:
+- keep the first session-value scoring pass heuristic and deterministic
+
+Scope and cwd notes:
+- this applies to the local memory pipeline workstream
+
+Reusable knowledge:
+- one reusable runtime hook is enough when it changes selection behavior deterministically
+
+Failures and how to do differently:
+- avoid coupling scoring to dashboards in the first pass
+
+High-value commands or paths:
+- `{command}`
+"
+        )
+    }
+
+    fn low_information_raw_memory() -> &'static str {
+        "\
+---
+description: Low information memory
+task: low-information-memory
+task_group: memory
+keywords: memory
+---
+
+### Task 1: Keep going
+task: keep-going
+task_group: memory
+task_outcome: partial
+
+Preference signals:
+
+Decision signals:
+
+Scope and cwd notes:
+
+Reusable knowledge:
+
+Failures and how to do differently:
+
+High-value commands or paths:
+"
+    }
+
+    #[tokio::test]
+    async fn list_memory_peek_entries_returns_recent_outputs_with_summary_excerpt() {
+        let codex_home = unique_temp_dir();
+        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
+            .await
+            .expect("initialize runtime");
+        let owner = ThreadId::from_string(&Uuid::new_v4().to_string()).expect("owner id");
+
+        let older_thread = seed_stage1_output(
+            &runtime,
+            codex_home.as_path(),
+            owner,
+            "workspace-a",
+            1_710_000_000,
+            "Older summary",
+            Some("older"),
+        )
+        .await;
+        let newer_summary = "Newer summary with enough words to confirm the excerpt path is using the rollout summary instead of the raw memory payload.";
+        let newer_thread = seed_stage1_output(
+            &runtime,
+            codex_home.as_path(),
+            owner,
+            "workspace-b",
+            1_710_000_100,
+            newer_summary,
+            Some("newer"),
+        )
+        .await;
+
+        let entries = runtime
+            .list_memory_peek_entries(/*limit*/ 2)
+            .await
+            .expect("load memory peek entries");
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].thread_id, newer_thread);
+        assert_eq!(entries[1].thread_id, older_thread);
+        assert_eq!(
+            entries[0].rollout_summary_file,
+            format!(
+                "rollout_summaries/{}",
+                rollout_summary_file_name_from_parts(
+                    newer_thread,
+                    Utc.timestamp_opt(1_710_000_100, 0)
+                        .single()
+                        .expect("source timestamp"),
+                    Some("newer"),
+                )
+            )
+        );
+        assert!(
+            entries[0].summary_excerpt.contains("Newer summary"),
+            "expected rollout summary excerpt, got {:?}",
+            entries[0]
+        );
+
+        let _ = tokio::fs::remove_dir_all(codex_home).await;
+    }
+
+    #[tokio::test]
+    async fn inspect_memory_health_reports_ok_for_consistent_layout() {
+        let codex_home = unique_temp_dir();
+        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
+            .await
+            .expect("initialize runtime");
+        let owner = ThreadId::from_string(&Uuid::new_v4().to_string()).expect("owner id");
+        let thread_id = seed_stage1_output(
+            &runtime,
+            codex_home.as_path(),
+            owner,
+            "workspace-healthy",
+            1_710_100_000,
+            "Healthy rollout summary",
+            Some("healthy"),
+        )
+        .await;
+
+        let memory_root = codex_home.join("memories");
+        let rollout_dir = memory_root.join("rollout_summaries");
+        tokio::fs::create_dir_all(&rollout_dir)
+            .await
+            .expect("create rollout summaries dir");
+        tokio::fs::write(memory_root.join("MEMORY.md"), "# Memory\n\nHealthy\n")
+            .await
+            .expect("write MEMORY.md");
+        tokio::fs::write(
+            memory_root.join("memory_summary.md"),
+            "Healthy memory summary\n",
+        )
+        .await
+        .expect("write memory_summary.md");
+        tokio::fs::write(
+            memory_root.join("raw_memories.md"),
+            "# Raw Memories\n\nHealthy raw memory\n",
+        )
+        .await
+        .expect("write raw_memories.md");
+        tokio::fs::write(
+            rollout_dir.join(rollout_summary_file_name_from_parts(
+                thread_id,
+                Utc.timestamp_opt(1_710_100_000, 0)
+                    .single()
+                    .expect("source timestamp"),
+                Some("healthy"),
+            )),
+            "thread_id: healthy\n\nHealthy rollout summary\n",
+        )
+        .await
+        .expect("write rollout summary");
+
+        let report = runtime
+            .inspect_memory_health(
+                /*max_raw_memories_for_consolidation*/ 10, /*max_unused_days*/ 36_500,
+            )
+            .await
+            .expect("inspect memory health");
+
+        assert!(report.ok, "expected healthy report, got {report:?}");
+        assert!(
+            report.issues.is_empty(),
+            "expected no issues, got {report:?}"
+        );
+        assert_eq!(report.rollout_summaries.expected.len(), 1);
+        assert!(report.rollout_summaries.expected[0].exists);
+
+        let _ = tokio::fs::remove_dir_all(codex_home).await;
+    }
+
+    #[tokio::test]
+    async fn inspect_memory_health_reports_missing_and_stale_sources() {
+        let codex_home = unique_temp_dir();
+        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
+            .await
+            .expect("initialize runtime");
+        let owner = ThreadId::from_string(&Uuid::new_v4().to_string()).expect("owner id");
+        let _thread_id = seed_stage1_output(
+            &runtime,
+            codex_home.as_path(),
+            owner,
+            "workspace-broken",
+            1_710_200_000,
+            "Broken rollout summary",
+            Some("broken"),
+        )
+        .await;
+
+        let rollout_dir = codex_home.join("memories").join("rollout_summaries");
+        tokio::fs::create_dir_all(&rollout_dir)
+            .await
+            .expect("create rollout summaries dir");
+        tokio::fs::write(rollout_dir.join("stale.md"), "stale summary\n")
+            .await
+            .expect("write stale rollout summary");
+        tokio::fs::write(rollout_dir.join("orphan.txt"), "not a markdown source\n")
+            .await
+            .expect("write malformed retrieval source");
+
+        let report = runtime
+            .inspect_memory_health(
+                /*max_raw_memories_for_consolidation*/ 10, /*max_unused_days*/ 36_500,
+            )
+            .await
+            .expect("inspect broken memory health");
+
+        assert!(!report.ok, "expected unhealthy report, got {report:?}");
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.code == "missing_memory"),
+            "expected missing MEMORY.md issue, got {report:?}"
+        );
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.code == "missing_memory_summary"),
+            "expected missing memory_summary.md issue, got {report:?}"
+        );
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.code == "missing_rollout_summary"),
+            "expected missing rollout summary issue, got {report:?}"
+        );
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.code == "stale_rollout_summary"),
+            "expected stale rollout summary issue, got {report:?}"
+        );
+        assert!(
+            report.issues.iter().any(|issue| {
+                issue.code == "malformed_retrieval_source"
+                    && issue.severity == MemoryHealthSeverity::Warning
+            }),
+            "expected malformed retrieval source warning, got {report:?}"
+        );
 
         let _ = tokio::fs::remove_dir_all(codex_home).await;
     }

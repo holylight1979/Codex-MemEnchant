@@ -294,6 +294,21 @@ client_request_definitions! {
         params: v2::ThreadMemoryModeSetParams,
         response: v2::ThreadMemoryModeSetResponse,
     },
+    #[experimental("memory/peek")]
+    MemoryPeek => "memory/peek" {
+        params: #[ts(type = "undefined")] #[serde(skip_serializing_if = "Option::is_none")] Option<()>,
+        response: v2::MemoryPeekResponse,
+    },
+    #[experimental("memory/health")]
+    MemoryHealth => "memory/health" {
+        params: #[ts(type = "undefined")] #[serde(skip_serializing_if = "Option::is_none")] Option<()>,
+        response: v2::MemoryHealthResponse,
+    },
+    #[experimental("memory/suppress")]
+    MemorySuppress => "memory/suppress" {
+        params: v2::MemorySuppressParams,
+        response: v2::MemorySuppressResponse,
+    },
     #[experimental("memory/reset")]
     MemoryReset => "memory/reset" {
         params: #[ts(type = "undefined")] #[serde(skip_serializing_if = "Option::is_none")] Option<()>,
@@ -1838,6 +1853,37 @@ mod tests {
                 "id": 8,
                 "params": {
                     "threadId": "thr_123"
+                }
+            }),
+            serde_json::to_value(&request)?,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn serialize_memory_suppress() -> Result<()> {
+        let request = ClientRequest::MemorySuppress {
+            request_id: RequestId::Integer(9),
+            params: v2::MemorySuppressParams {
+                target: v2::MemoryNegativeFeedbackTarget {
+                    thread_id: "thread_123".to_string(),
+                    source_updated_at: Some(42),
+                    rollout_slug: Some("task".to_string()),
+                },
+                reason: v2::MemoryNegativeFeedbackReason::PrivacySensitive,
+            },
+        };
+        assert_eq!(
+            json!({
+                "method": "memory/suppress",
+                "id": 9,
+                "params": {
+                    "target": {
+                        "threadId": "thread_123",
+                        "sourceUpdatedAt": 42,
+                        "rolloutSlug": "task"
+                    },
+                    "reason": "privacy_sensitive"
                 }
             }),
             serde_json::to_value(&request)?,

@@ -2139,6 +2139,77 @@ async fn includes_developer_instructions_message_in_request() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn includes_memory_retrieval_bundle_in_initial_request_when_memories_match() {
+    skip_if_no_network!();
+    let server = MockServer::start().await;
+
+    let resp_mock = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
+    )
+    .await;
+
+    let codex_home = Arc::new(TempDir::new().unwrap());
+    let memories_dir = codex_home.path().join("memories");
+    std::fs::create_dir_all(memories_dir.join("rollout_summaries")).unwrap();
+    std::fs::write(
+        memories_dir.join("memory_summary.md"),
+        "Windows Rust build memory: prefer cargo nextest for focused verification.",
+    )
+    .unwrap();
+    std::fs::write(
+        memories_dir.join("MEMORY.md"),
+        "# Testing\n\n## Windows builds\nUse cargo nextest when fixing Rust code on this machine.\n",
+    )
+    .unwrap();
+
+    let mut builder = test_codex()
+        .with_auth(CodexAuth::from_api_key("Test API Key"))
+        .with_home(codex_home.clone())
+        .with_config(|config| {
+            config
+                .features
+                .enable(Feature::MemoryTool)
+                .expect("test config should allow feature update");
+            config.memories.use_memories = true;
+        });
+    let codex = builder
+        .build(&server)
+        .await
+        .expect("create new conversation")
+        .codex;
+
+    codex
+        .submit(Op::UserInput {
+            environments: None,
+            items: vec![UserInput::Text {
+                text: "run nextest for this Rust fix".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+        })
+        .await
+        .unwrap();
+
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    let request = resp_mock.single_request();
+    let developer_text = request.message_input_texts("developer").join("\n\n");
+
+    assert!(
+        developer_text.contains("<memory_retrieval_bundle>"),
+        "expected retrieval bundle in developer messages, got {developer_text:?}"
+    );
+    assert!(
+        developer_text.contains("cargo nextest"),
+        "expected retrieved memory content in developer messages, got {developer_text:?}"
+    );
+
+    let _codex_home_guard = codex_home;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn azure_responses_request_includes_store_and_reasoning_ids() {
     skip_if_no_network!();
 

@@ -116,3 +116,53 @@ async fn build_memory_tool_developer_instructions_renders_embedded_template() {
         1
     );
 }
+
+#[test]
+fn stage_one_prompt_requires_structured_preference_and_decision_sections() {
+    let prompt = crate::memories::phase_one::PROMPT;
+
+    assert!(prompt.contains("Decision signals:"));
+    assert!(prompt.contains("Scope and cwd notes:"));
+    assert!(prompt.contains("High-value commands or paths:"));
+    assert!(prompt.contains("keep the heading and write `- none`"));
+}
+
+#[test]
+fn build_consolidation_prompt_mentions_new_phase1_sections() {
+    let prompt = build_consolidation_prompt(
+        Path::new("/tmp/memories"),
+        &Phase2InputSelection::default(),
+        &[],
+    );
+
+    assert!(prompt.contains("`Preference signals:` and"));
+    assert!(prompt.contains("`Decision signals:`"));
+    assert!(prompt.contains("`Scope and cwd notes:`"));
+    assert!(prompt.contains("\"High-value commands or paths\""));
+}
+
+#[test]
+fn build_consolidation_prompt_separates_episodic_and_durable_memory_roles() {
+    let prompt = build_consolidation_prompt(
+        Path::new("/tmp/memories"),
+        &Phase2InputSelection::default(),
+        &[],
+    );
+
+    assert!(
+        prompt
+            .contains("Treat `raw_memories.md` and `rollout_summaries/*.md` as episodic evidence.")
+    );
+    assert!(prompt.contains(
+        "Treat `MEMORY.md`, `memory_summary.md`, and any `skills/*` as durable artifacts."
+    ));
+    assert!(prompt.contains("Keep content only in episodic evidence when it is mainly useful for reconstructing one run:"));
+    assert!(prompt.contains(
+        "Promote content into durable memory only when it should change future default behavior:"
+    ));
+    assert!(
+        prompt.contains(
+            "Current selected Phase 1 inputs (episodic evidence candidates for this run):"
+        )
+    );
+}

@@ -19,6 +19,7 @@ use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_protocol::protocol::RealtimeOutputModality;
 use pretty_assertions::assert_eq;
+use serde_json::json;
 use std::path::Path;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -123,6 +124,44 @@ async fn thread_memory_mode_set_requires_experimental_api_capability() -> Result
     )
     .await??;
     assert_experimental_capability_error(error, "thread/memoryMode/set");
+    Ok(())
+}
+
+#[tokio::test]
+async fn memory_suppress_requires_experimental_api_capability() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+
+    let init = mcp
+        .initialize_with_capabilities(
+            default_client_info(),
+            Some(InitializeCapabilities {
+                experimental_api: false,
+                opt_out_notification_methods: None,
+            }),
+        )
+        .await?;
+    let JSONRPCMessage::Response(_) = init else {
+        anyhow::bail!("expected initialize response, got {init:?}");
+    };
+
+    let request_id = mcp
+        .send_raw_request(
+            "memory/suppress",
+            Some(json!({
+                "target": {
+                    "threadId": "thr_123"
+                },
+                "reason": "transient"
+            })),
+        )
+        .await?;
+    let error = timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+    assert_experimental_capability_error(error, "memory/suppress");
     Ok(())
 }
 

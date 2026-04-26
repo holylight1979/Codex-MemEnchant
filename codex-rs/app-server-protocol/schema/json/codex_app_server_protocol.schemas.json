@@ -10761,6 +10761,254 @@
         ],
         "type": "object"
       },
+      "MemoryDirectoryHealth": {
+        "properties": {
+          "exists": {
+            "type": "boolean"
+          },
+          "isDirectory": {
+            "type": "boolean"
+          },
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "exists",
+          "isDirectory",
+          "path"
+        ],
+        "type": "object"
+      },
+      "MemoryHealthArtifact": {
+        "properties": {
+          "exists": {
+            "type": "boolean"
+          },
+          "isFile": {
+            "type": "boolean"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "readable": {
+            "type": "boolean"
+          },
+          "sizeBytes": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "exists",
+          "isFile",
+          "kind",
+          "path",
+          "readable"
+        ],
+        "type": "object"
+      },
+      "MemoryHealthIssue": {
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "severity": {
+            "$ref": "#/definitions/v2/MemoryHealthSeverity"
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "severity"
+        ],
+        "type": "object"
+      },
+      "MemoryHealthRolloutSummary": {
+        "properties": {
+          "exists": {
+            "type": "boolean"
+          },
+          "fileName": {
+            "type": "string"
+          },
+          "isFile": {
+            "type": "boolean"
+          },
+          "path": {
+            "type": "string"
+          },
+          "readable": {
+            "type": "boolean"
+          },
+          "sizeBytes": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "exists",
+          "fileName",
+          "isFile",
+          "path",
+          "readable"
+        ],
+        "type": "object"
+      },
+      "MemoryHealthRolloutSummarySet": {
+        "properties": {
+          "directory": {
+            "$ref": "#/definitions/v2/MemoryDirectoryHealth"
+          },
+          "expected": {
+            "items": {
+              "$ref": "#/definitions/v2/MemoryHealthRolloutSummary"
+            },
+            "type": "array"
+          },
+          "stale": {
+            "items": {
+              "$ref": "#/definitions/v2/MemoryHealthRolloutSummary"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "directory",
+          "expected",
+          "stale"
+        ],
+        "type": "object"
+      },
+      "MemoryHealthSeverity": {
+        "enum": [
+          "warning",
+          "error"
+        ],
+        "type": "string"
+      },
+      "MemoryNegativeFeedbackReason": {
+        "enum": [
+          "transient",
+          "incorrect_inference",
+          "wrong_scope",
+          "privacy_sensitive",
+          "duplicate"
+        ],
+        "type": "string"
+      },
+      "MemoryNegativeFeedbackRecord": {
+        "properties": {
+          "createdAt": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "reason": {
+            "$ref": "#/definitions/v2/MemoryNegativeFeedbackReason"
+          },
+          "rolloutSlug": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sourceUpdatedAt": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "threadId": {
+            "type": "string"
+          },
+          "updatedAt": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "createdAt",
+          "reason",
+          "sourceUpdatedAt",
+          "threadId",
+          "updatedAt"
+        ],
+        "type": "object"
+      },
+      "MemoryNegativeFeedbackTarget": {
+        "properties": {
+          "rolloutSlug": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sourceUpdatedAt": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "threadId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "threadId"
+        ],
+        "type": "object"
+      },
+      "MemoryPeekEntry": {
+        "properties": {
+          "cwd": {
+            "type": "string"
+          },
+          "generatedAt": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "rolloutSummaryFile": {
+            "type": "string"
+          },
+          "sourceUpdatedAt": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "summaryExcerpt": {
+            "type": "string"
+          },
+          "threadId": {
+            "type": "string"
+          },
+          "threadUpdatedAt": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "cwd",
+          "generatedAt",
+          "rolloutSummaryFile",
+          "sourceUpdatedAt",
+          "summaryExcerpt",
+          "threadId",
+          "threadUpdatedAt"
+        ],
+        "type": "object"
+      },
       "MergeStrategy": {
         "enum": [
           "replace",

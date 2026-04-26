@@ -16,6 +16,45 @@ use serde_json::Value;
 use std::path::PathBuf;
 use tempfile::tempdir;
 
+fn structured_phase1_raw_memory() -> String {
+    "\
+---
+description: Hardened memory extraction around phase-1 preference and decision capture
+task: codex-memory-p0-2-validation
+task_group: codex-memory
+task_outcome: success
+cwd: /tmp/workspace
+keywords: codex-memory, phase1, preference-signals, decision-signals, rollout-validation
+---
+
+### Task 1: Validate phase-1 structure
+
+task: validate-phase1-structure
+task_group: codex-memory
+task_outcome: success
+
+Preference signals:
+- when memory work is underway, the user asked to strengthen preference extraction without starting schema migration -> default to prompt and validator improvements before DB work
+
+Decision signals:
+- preserve explicit task-level decision triggers so Phase 2 can route preference and workflow choices without reading broad prose
+
+Scope and cwd notes:
+- primary cwd is `/tmp/workspace`; treat the guidance as checkout-local until similar evidence appears elsewhere
+
+Reusable knowledge:
+- a fixed task-block skeleton makes grep and consolidation more reliable than free-form markdown
+
+Failures and how to do differently:
+- avoid accepting prose-only raw memories because they make downstream consolidation less deterministic
+
+High-value commands or paths:
+- `cargo test -p codex-core validate_stage_one_output`
+- `/tmp/workspace/codex-rs/core/templates/memories/stage_one_system.md`
+"
+    .to_string()
+}
+
 #[test]
 fn memory_root_uses_shared_global_path() {
     let codex_home = AbsolutePathBuf::current_dir().expect("cwd").join("codex");
@@ -343,23 +382,7 @@ async fn rebuild_raw_memories_file_adds_canonical_rollout_summary_file_header() 
     let memories = vec![Stage1Output {
         thread_id,
         source_updated_at: Utc.timestamp_opt(200, 0).single().expect("timestamp"),
-        raw_memory: "\
----
-description: Added a migration test
-keywords: codex-state, migrations
----
-### Task 1: migration-test
-task: add-migration-test
-task_group: codex-state
-task_outcome: success
-- Added regression coverage for migration uniqueness.
-
-### Task 2: validate-migration
-task: validate-migration-ordering
-task_group: codex-state
-task_outcome: success
-- Confirmed no ordering regressions."
-            .to_string(),
+        raw_memory: structured_phase1_raw_memory(),
         rollout_summary: "short summary".to_string(),
         rollout_slug: Some("Unsafe Slug/With Spaces & Symbols + EXTRA_LONG_12345".to_string()),
         rollout_path: PathBuf::from("/tmp/rollout-200.jsonl"),
@@ -406,11 +429,18 @@ task_outcome: success
     assert!(raw_memories.contains(&format!(
         "rollout_summary_file: {canonical_rollout_summary_file}"
     )));
-    assert!(raw_memories.contains("description: Added a migration test"));
-    assert!(raw_memories.contains("### Task 1: migration-test"));
-    assert!(raw_memories.contains("task: add-migration-test"));
-    assert!(raw_memories.contains("task_group: codex-state"));
+    assert!(raw_memories.contains(
+        "description: Hardened memory extraction around phase-1 preference and decision capture"
+    ));
+    assert!(raw_memories.contains("### Task 1: Validate phase-1 structure"));
+    assert!(raw_memories.contains("task: validate-phase1-structure"));
+    assert!(raw_memories.contains("task_group: codex-memory"));
     assert!(raw_memories.contains("task_outcome: success"));
+    assert!(raw_memories.contains("Preference signals:"));
+    assert!(raw_memories.contains("Decision signals:"));
+    assert!(raw_memories.contains("Scope and cwd notes:"));
+    assert!(raw_memories.contains("High-value commands or paths:"));
+    assert!(raw_memories.contains("cargo test -p codex-core validate_stage_one_output"));
 }
 
 mod phase2 {

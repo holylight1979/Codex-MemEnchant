@@ -9,11 +9,13 @@ mod control;
 mod phase1;
 mod phase2;
 pub(crate) mod prompts;
+mod retrieval;
 mod start;
 mod storage;
 #[cfg(test)]
 mod tests;
 pub(crate) mod usage;
+mod validate;
 
 use codex_protocol::openai_models::ReasoningEffort;
 

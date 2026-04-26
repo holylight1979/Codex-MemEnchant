@@ -20,20 +20,32 @@ CONTEXT: MEMORY FOLDER STRUCTURE
 Folder structure (under {{ memory_root }}/):
 
 - memory_summary.md
-  - Always loaded into the system prompt. Must remain informative and highly navigational,
-    but still discriminative enough to guide retrieval.
+  - Durable artifact. Always loaded into the system prompt. Must remain informative and highly
+    navigational, but still discriminative enough to guide retrieval.
 - MEMORY.md
-  - Handbook entries. Used to grep for keywords; aggregated insights from rollouts;
-    pointers to rollout summaries if certain past rollouts are very relevant.
+  - Durable artifact. Handbook entries. Used to grep for keywords; aggregated insights from
+    rollouts; pointers to rollout summaries if certain past rollouts are very relevant.
 - raw_memories.md
-  - Temporary file: merged raw memories from Phase 1. Input for Phase 2.
+  - Episodic evidence. Temporary file: merged raw memories from Phase 1. Input for Phase 2.
 - skills/<skill-name>/
   - Reusable procedures. Entrypoint: SKILL.md; may include scripts/, templates/, examples/.
 - rollout_summaries/<rollout_slug>.md
-  - Recap of the rollout, including lessons learned, reusable knowledge,
+  - Episodic evidence. Recap of the rollout, including lessons learned, reusable knowledge,
     pointers/references, and pruned raw evidence snippets. Distilled version of
     everything valuable from the raw rollout.
 {{ memory_extensions_folder_structure }}
+============================================================
+EPISODIC VS DURABLE SEPARATION (STRICT)
+============================================================
+
+- Treat `raw_memories.md` and `rollout_summaries/*.md` as episodic evidence.
+  - They preserve prior-run detail, provenance, and recency-sensitive context.
+  - They may be richer and more permissive than durable memory.
+- Treat `MEMORY.md`, `memory_summary.md`, and any `skills/*` as durable artifacts.
+  - They should contain reusable defaults, validated guidance, and stable routing handles.
+- Do not promote material into durable artifacts just because it is recent or detailed.
+- `memory_summary.md` is an index over durable memory, not a dump of recent session history.
+
 ============================================================
 GLOBAL SAFETY, HYGIENE, AND NO-FILLER RULES (STRICT)
 ============================================================
@@ -155,8 +167,9 @@ Incremental update and forgetting mechanism:
 - For each added thread id, search it in `raw_memories.md`, read that raw-memory section, and
   read the corresponding `rollout_summaries/*.md` file only when needed for stronger evidence,
   task placement, or conflict resolution.
-  - When scanning a raw-memory section, read the task-level `Preference signals:` subsections
-    first, then the rest of the task blocks.
+  - When scanning a raw-memory section, read the task-level `Preference signals:` and
+    `Decision signals:` subsections first, then `Scope and cwd notes:`, then the rest of the
+    task blocks.
 - For each removed thread id, search it in `MEMORY.md` and delete only the memory supported by
   that thread. Use `thread_id=<thread_id>` in `### rollout_summary_files` when available; if not,
   fall back to rollout summary filenames plus the corresponding `rollout_summaries/*.md` files.
@@ -166,6 +179,23 @@ Incremental update and forgetting mechanism:
   threads intact.
 - After `MEMORY.md` cleanup is done, revisit `memory_summary.md` and remove or rewrite stale
   summary/index content that was only supported by removed thread ids.
+
+Promotion policy (strict):
+
+- Keep content only in episodic evidence when it is mainly useful for reconstructing one run:
+  - raw command/output snippets beyond a minimal anchor
+  - implementation status updates or "what happened this time" narration
+  - exploratory discussion, tentative ideas, or assistant proposals that were not clearly adopted
+  - recency-sensitive checkout state that should be reconfirmed before reuse
+  - task-local evidence that helps audit provenance but does not change future default behavior
+- Promote content into durable memory only when it should change future default behavior:
+  - stable or repeated user operating preferences
+  - validated repo/system facts and task-routing boundaries
+  - reusable procedures, exact commands, or high-leverage paths that save future exploration
+  - recurring decision triggers and acceptance rules
+  - durable failure shields (`symptom -> cause -> fix / pivot`)
+- If a detail is useful mainly as supporting evidence for one task family, keep it in
+  `rollout_summaries/*.md` and point to it from durable memory only when that pointer improves retrieval.
 
 Outputs:
 Under `{{ memory_root }}/`:
@@ -298,6 +328,8 @@ Schema rules (strict):
     more tasks in the same block and should use task refs like `[Task 1]` when helpful.
   - Treat task-level `Preference signals:` from Phase 1 as the main source for consolidated
     `## User preferences`.
+  - Treat task-level `Decision signals:` and `Scope and cwd notes:` from Phase 1 as the main
+    source for routing boundaries, applies-to details, acceptance criteria, and pivot triggers.
   - Treat task-level `Reusable knowledge:` from Phase 1 as the main source for block-level
     `## Reusable knowledge`.
   - Treat task-level `Failures and how to do differently:` from Phase 1 as the main source for
@@ -342,13 +374,18 @@ Schema rules (strict):
 What to write:
 
 - Extract the takeaways from rollout summaries and raw_memories, especially sections like
-  "Preference signals", "Reusable knowledge", "References", and "Failures and how to do differently".
+  "Preference signals", "Decision signals", "Scope and cwd notes", "Reusable knowledge",
+  "High-value commands or paths", and "Failures and how to do differently".
+- Preserve one-off run detail, provenance, and richer supporting evidence in
+  `rollout_summaries/*.md` unless carrying it into durable memory would clearly improve future
+  default behavior.
 - Wording-preservation rule: when the source already contains a concise, searchable phrase,
   keep that phrase instead of paraphrasing it into smoother but less faithful prose.
   Prefer exact or near-exact wording from:
   - user messages,
   - task `description:` lines,
   - `Preference signals:`,
+  - `Decision signals:`,
   - exact error strings / API names / parameter names / file names / commands.
 - Do not rewrite concrete wording into more abstract synonyms when the original wording fits.
   Bad: `the user prefers evidence-backed debugging`
@@ -783,7 +820,7 @@ WORKFLOW
    - Start by inventorying the real files on disk (`rg --files rollout_summaries` or
      equivalent) and only open/cite rollout summaries from that set.
   - Start with a preference-first pass:
-    - identify the strongest task-level `Preference signals:` and repeated steering patterns
+    - identify the strongest task-level `Preference signals:`, `Decision signals:`, and repeated steering patterns
     - decide which of them add up to block-level `## User preferences`
     - only then compress the procedural knowledge underneath
    - If raw memory mentions a rollout summary file that is missing on disk, do not invent or

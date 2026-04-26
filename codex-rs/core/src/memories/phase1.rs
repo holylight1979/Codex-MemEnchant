@@ -64,6 +64,26 @@ struct Stats {
     total_token_usage: Option<TokenUsage>,
 }
 
+const RAW_MEMORY_FRONTMATTER_KEYS: &[&str] = &[
+    "description:",
+    "task:",
+    "task_group:",
+    "task_outcome:",
+    "cwd:",
+    "keywords:",
+];
+
+const RAW_MEMORY_REQUIRED_TASK_LINES: &[&str] = &["task:", "task_group:", "task_outcome:"];
+
+const RAW_MEMORY_REQUIRED_TASK_SECTIONS: &[&str] = &[
+    "Preference signals:",
+    "Decision signals:",
+    "Scope and cwd notes:",
+    "Reusable knowledge:",
+    "Failures and how to do differently:",
+    "High-value commands or paths:",
+];
+
 /// Phase 1 model output payload.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -388,6 +408,7 @@ mod job {
         output.raw_memory = redact_secrets(output.raw_memory);
         output.rollout_summary = redact_secrets(output.rollout_summary);
         output.rollout_slug = output.rollout_slug.map(redact_secrets);
+        validate_stage_one_output(&output)?;
 
         Ok((output, token_usage))
     }
@@ -523,6 +544,125 @@ mod job {
             phase: phase.clone(),
         })
     }
+}
+
+fn validate_stage_one_output(output: &StageOneOutput) -> anyhow::Result<()> {
+    let raw_memory = output.raw_memory.trim();
+    let rollout_summary = output.rollout_summary.trim();
+
+    if raw_memory.is_empty() && rollout_summary.is_empty() {
+        return Ok(());
+    }
+
+    if raw_memory.is_empty() || rollout_summary.is_empty() {
+        anyhow::bail!(
+            "stage-1 output must either be a full no-op or include both raw_memory and rollout_summary"
+        );
+    }
+
+    validate_rollout_summary_structure(rollout_summary)?;
+    validate_raw_memory_structure(raw_memory)?;
+
+    Ok(())
+}
+
+fn validate_rollout_summary_structure(rollout_summary: &str) -> anyhow::Result<()> {
+    if !rollout_summary.starts_with("# ") {
+        anyhow::bail!("rollout_summary must start with a level-1 heading");
+    }
+
+    if !rollout_summary.contains("Rollout context:") {
+        anyhow::bail!("rollout_summary must include a Rollout context section");
+    }
+
+    if !rollout_summary.contains("\n## Task 1:") {
+        anyhow::bail!("rollout_summary must include at least one task section");
+    }
+
+    Ok(())
+}
+
+fn validate_raw_memory_structure(raw_memory: &str) -> anyhow::Result<()> {
+    let lines = raw_memory.lines().collect::<Vec<_>>();
+
+    let Some(first_line) = lines.first() else {
+        anyhow::bail!("raw_memory cannot be empty");
+    };
+    if *first_line != "---" {
+        anyhow::bail!("raw_memory must start with frontmatter");
+    }
+
+    let Some(frontmatter_end) = lines.iter().skip(1).position(|line| *line == "---") else {
+        anyhow::bail!("raw_memory frontmatter must end with a closing ---");
+    };
+    let frontmatter_end = frontmatter_end + 1;
+
+    let frontmatter = &lines[1..frontmatter_end];
+    for key in RAW_MEMORY_FRONTMATTER_KEYS {
+        if !frontmatter.iter().any(|line| line.starts_with(key)) {
+            anyhow::bail!("raw_memory frontmatter is missing `{key}`");
+        }
+    }
+
+    let task_indices = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, line)| line.starts_with("### Task ").then_some(idx))
+        .collect::<Vec<_>>();
+    if task_indices.is_empty() {
+        anyhow::bail!("raw_memory must include at least one task block");
+    }
+
+    for (task_number, start) in task_indices.iter().enumerate() {
+        let end = task_indices
+            .get(task_number + 1)
+            .copied()
+            .unwrap_or(lines.len());
+        validate_raw_memory_task_block(task_number + 1, &lines[*start..end])?;
+    }
+
+    Ok(())
+}
+
+fn validate_raw_memory_task_block(task_number: usize, block_lines: &[&str]) -> anyhow::Result<()> {
+    for required_line in RAW_MEMORY_REQUIRED_TASK_LINES {
+        if !block_lines
+            .iter()
+            .any(|line| line.starts_with(required_line))
+        {
+            anyhow::bail!("raw_memory task {task_number} is missing `{required_line}`");
+        }
+    }
+
+    let mut last_section_idx = 0usize;
+    for (section_idx, section_name) in RAW_MEMORY_REQUIRED_TASK_SECTIONS.iter().enumerate() {
+        let Some(position) = block_lines.iter().position(|line| *line == *section_name) else {
+            anyhow::bail!("raw_memory task {task_number} is missing `{section_name}`");
+        };
+        if section_idx > 0 && position <= last_section_idx {
+            anyhow::bail!("raw_memory task {task_number} has `{section_name}` out of order");
+        }
+
+        let next_position = RAW_MEMORY_REQUIRED_TASK_SECTIONS
+            .iter()
+            .skip(section_idx + 1)
+            .filter_map(|next_section| block_lines.iter().position(|line| *line == *next_section))
+            .min()
+            .unwrap_or(block_lines.len());
+
+        if !block_lines[position + 1..next_position]
+            .iter()
+            .any(|line| line.starts_with("- "))
+        {
+            anyhow::bail!(
+                "raw_memory task {task_number} section `{section_name}` must include at least one bullet"
+            );
+        }
+
+        last_section_idx = position;
+    }
+
+    Ok(())
 }
 
 fn aggregate_stats(outcomes: Vec<JobResult>) -> Stats {

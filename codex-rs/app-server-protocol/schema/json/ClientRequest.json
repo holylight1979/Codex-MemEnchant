@@ -1808,6 +1808,40 @@
       ],
       "type": "object"
     },
+    "MemoryNegativeFeedbackReason": {
+      "enum": [
+        "transient",
+        "incorrect_inference",
+        "wrong_scope",
+        "privacy_sensitive",
+        "duplicate"
+      ],
+      "type": "string"
+    },
+    "MemoryNegativeFeedbackTarget": {
+      "properties": {
+        "rolloutSlug": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sourceUpdatedAt": {
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "threadId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "threadId"
+      ],
+      "type": "object"
+    },
     "MergeStrategy": {
       "enum": [
         "replace",

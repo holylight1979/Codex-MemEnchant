@@ -100,7 +100,21 @@ use codex_app_server_protocol::McpServerStatus;
 use codex_app_server_protocol::McpServerStatusDetail;
 use codex_app_server_protocol::McpServerToolCallParams;
 use codex_app_server_protocol::McpServerToolCallResponse;
+use codex_app_server_protocol::MemoryDirectoryHealth;
+use codex_app_server_protocol::MemoryHealthArtifact;
+use codex_app_server_protocol::MemoryHealthIssue;
+use codex_app_server_protocol::MemoryHealthResponse;
+use codex_app_server_protocol::MemoryHealthRolloutSummary;
+use codex_app_server_protocol::MemoryHealthRolloutSummarySet;
+use codex_app_server_protocol::MemoryHealthSeverity;
+use codex_app_server_protocol::MemoryNegativeFeedbackReason;
+use codex_app_server_protocol::MemoryNegativeFeedbackRecord;
+use codex_app_server_protocol::MemoryNegativeFeedbackTarget;
+use codex_app_server_protocol::MemoryPeekEntry;
+use codex_app_server_protocol::MemoryPeekResponse;
 use codex_app_server_protocol::MemoryResetResponse;
+use codex_app_server_protocol::MemorySuppressParams;
+use codex_app_server_protocol::MemorySuppressResponse;
 use codex_app_server_protocol::MockExperimentalMethodParams;
 use codex_app_server_protocol::MockExperimentalMethodResponse;
 use codex_app_server_protocol::ModelListParams;
@@ -346,6 +360,8 @@ use codex_rmcp_client::perform_oauth_login_return_url;
 use codex_rollout::state_db::StateDbHandle;
 use codex_rollout::state_db::get_state_db;
 use codex_rollout::state_db::reconcile_rollout;
+use codex_state::MemoryNegativeFeedbackReason as StateMemoryNegativeFeedbackReason;
+use codex_state::MemoryNegativeFeedbackTarget as StateMemoryNegativeFeedbackTarget;
 use codex_state::StateRuntime;
 use codex_state::ThreadMetadata;
 use codex_state::ThreadMetadataBuilder;
@@ -926,6 +942,18 @@ impl CodexMessageProcessor {
             }
             ClientRequest::ThreadMemoryModeSet { request_id, params } => {
                 self.thread_memory_mode_set(to_connection_request_id(request_id), params)
+                    .await;
+            }
+            ClientRequest::MemoryPeek { request_id, params } => {
+                self.memory_peek(to_connection_request_id(request_id), params)
+                    .await;
+            }
+            ClientRequest::MemoryHealth { request_id, params } => {
+                self.memory_health(to_connection_request_id(request_id), params)
+                    .await;
+            }
+            ClientRequest::MemorySuppress { request_id, params } => {
+                self.memory_suppress(to_connection_request_id(request_id), params)
                     .await;
             }
             ClientRequest::MemoryReset { request_id, params } => {
@@ -3293,6 +3321,150 @@ impl CodexMessageProcessor {
 
         self.outgoing
             .send_response(request_id, MemoryResetResponse {})
+            .await;
+    }
+
+    async fn memory_peek(&self, request_id: ConnectionRequestId, _params: Option<()>) {
+        let state_db = match StateRuntime::init(
+            self.config.sqlite_home.clone(),
+            self.config.model_provider_id.clone(),
+        )
+        .await
+        {
+            Ok(state_db) => state_db,
+            Err(err) => {
+                self.send_internal_error(
+                    request_id,
+                    format!("failed to open state db for memory peek: {err}"),
+                )
+                .await;
+                return;
+            }
+        };
+
+        let entries = match state_db.list_memory_peek_entries(/*limit*/ 10).await {
+            Ok(entries) => entries,
+            Err(err) => {
+                self.send_internal_error(
+                    request_id,
+                    format!("failed to inspect memory peek entries: {err}"),
+                )
+                .await;
+                return;
+            }
+        };
+
+        self.outgoing
+            .send_response(
+                request_id,
+                MemoryPeekResponse {
+                    entries: entries.into_iter().map(map_memory_peek_entry).collect(),
+                },
+            )
+            .await;
+    }
+
+    async fn memory_health(&self, request_id: ConnectionRequestId, _params: Option<()>) {
+        let state_db = match StateRuntime::init(
+            self.config.sqlite_home.clone(),
+            self.config.model_provider_id.clone(),
+        )
+        .await
+        {
+            Ok(state_db) => state_db,
+            Err(err) => {
+                self.send_internal_error(
+                    request_id,
+                    format!("failed to open state db for memory health: {err}"),
+                )
+                .await;
+                return;
+            }
+        };
+
+        let report = match state_db
+            .inspect_memory_health(
+                self.config.memories.max_raw_memories_for_consolidation,
+                self.config.memories.max_unused_days,
+            )
+            .await
+        {
+            Ok(report) => report,
+            Err(err) => {
+                self.send_internal_error(
+                    request_id,
+                    format!("failed to inspect memory health: {err}"),
+                )
+                .await;
+                return;
+            }
+        };
+
+        self.outgoing
+            .send_response(request_id, map_memory_health_report(report))
+            .await;
+    }
+
+    async fn memory_suppress(&self, request_id: ConnectionRequestId, params: MemorySuppressParams) {
+        let state_db = match StateRuntime::init(
+            self.config.sqlite_home.clone(),
+            self.config.model_provider_id.clone(),
+        )
+        .await
+        {
+            Ok(state_db) => state_db,
+            Err(err) => {
+                self.send_internal_error(
+                    request_id,
+                    format!("failed to open state db for memory suppress: {err}"),
+                )
+                .await;
+                return;
+            }
+        };
+
+        let target = match map_memory_negative_feedback_target(params.target) {
+            Ok(target) => target,
+            Err(message) => {
+                self.send_invalid_request_error(request_id, message).await;
+                return;
+            }
+        };
+
+        let feedback = match state_db
+            .record_memory_negative_feedback(
+                &target,
+                map_memory_negative_feedback_reason(params.reason),
+            )
+            .await
+        {
+            Ok(feedback) => feedback,
+            Err(err) => {
+                let message = err.to_string();
+                if is_memory_negative_feedback_target_error(message.as_str()) {
+                    self.send_invalid_request_error(
+                        request_id,
+                        format!("invalid memory suppress target: {message}"),
+                    )
+                    .await;
+                } else {
+                    self.send_internal_error(
+                        request_id,
+                        format!("failed to record memory suppress feedback: {message}"),
+                    )
+                    .await;
+                }
+                return;
+            }
+        };
+
+        self.outgoing
+            .send_response(
+                request_id,
+                MemorySuppressResponse {
+                    feedback: map_memory_negative_feedback_record(feedback),
+                },
+            )
             .await;
     }
 
@@ -10233,6 +10405,161 @@ fn normalize_thread_turns_status(
         if matches!(turn.status, TurnStatus::InProgress) {
             turn.status = TurnStatus::Interrupted;
         }
+    }
+}
+
+fn map_memory_peek_entry(entry: codex_state::MemoryPeekEntry) -> MemoryPeekEntry {
+    MemoryPeekEntry {
+        thread_id: entry.thread_id.to_string(),
+        thread_updated_at: entry.thread_updated_at.timestamp(),
+        source_updated_at: entry.source_updated_at.timestamp(),
+        generated_at: entry.generated_at.timestamp(),
+        cwd: entry.cwd.display().to_string(),
+        rollout_summary_file: entry.rollout_summary_file,
+        summary_excerpt: entry.summary_excerpt,
+    }
+}
+
+fn map_memory_negative_feedback_target(
+    target: MemoryNegativeFeedbackTarget,
+) -> Result<StateMemoryNegativeFeedbackTarget, String> {
+    let thread_id = ThreadId::from_string(&target.thread_id)
+        .map_err(|err| format!("invalid thread id: {err}"))?;
+    let source_updated_at = target
+        .source_updated_at
+        .map(|seconds| {
+            DateTime::<Utc>::from_timestamp(seconds, 0)
+                .ok_or_else(|| format!("invalid sourceUpdatedAt timestamp: {seconds}"))
+        })
+        .transpose()?;
+
+    Ok(StateMemoryNegativeFeedbackTarget {
+        thread_id,
+        source_updated_at,
+        rollout_slug: target.rollout_slug,
+    })
+}
+
+fn map_memory_negative_feedback_reason(
+    reason: MemoryNegativeFeedbackReason,
+) -> StateMemoryNegativeFeedbackReason {
+    match reason {
+        MemoryNegativeFeedbackReason::Transient => StateMemoryNegativeFeedbackReason::Transient,
+        MemoryNegativeFeedbackReason::IncorrectInference => {
+            StateMemoryNegativeFeedbackReason::IncorrectInference
+        }
+        MemoryNegativeFeedbackReason::WrongScope => StateMemoryNegativeFeedbackReason::WrongScope,
+        MemoryNegativeFeedbackReason::PrivacySensitive => {
+            StateMemoryNegativeFeedbackReason::PrivacySensitive
+        }
+        MemoryNegativeFeedbackReason::Duplicate => StateMemoryNegativeFeedbackReason::Duplicate,
+    }
+}
+
+fn map_memory_negative_feedback_record(
+    record: codex_state::MemoryNegativeFeedbackRecord,
+) -> MemoryNegativeFeedbackRecord {
+    MemoryNegativeFeedbackRecord {
+        thread_id: record.thread_id.to_string(),
+        source_updated_at: record.source_updated_at.timestamp(),
+        rollout_slug: record.rollout_slug,
+        reason: match record.reason {
+            StateMemoryNegativeFeedbackReason::Transient => MemoryNegativeFeedbackReason::Transient,
+            StateMemoryNegativeFeedbackReason::IncorrectInference => {
+                MemoryNegativeFeedbackReason::IncorrectInference
+            }
+            StateMemoryNegativeFeedbackReason::WrongScope => {
+                MemoryNegativeFeedbackReason::WrongScope
+            }
+            StateMemoryNegativeFeedbackReason::PrivacySensitive => {
+                MemoryNegativeFeedbackReason::PrivacySensitive
+            }
+            StateMemoryNegativeFeedbackReason::Duplicate => MemoryNegativeFeedbackReason::Duplicate,
+        },
+        created_at: record.created_at.timestamp(),
+        updated_at: record.updated_at.timestamp(),
+    }
+}
+
+fn is_memory_negative_feedback_target_error(message: &str) -> bool {
+    message.starts_with("no persisted stage-1 output")
+        || message.starts_with("rollout slug mismatch")
+}
+
+fn map_memory_health_report(report: codex_state::MemoryHealthReport) -> MemoryHealthResponse {
+    MemoryHealthResponse {
+        ok: report.ok,
+        memory_root: map_memory_directory_health(report.memory_root),
+        artifacts: report
+            .artifacts
+            .into_iter()
+            .map(map_memory_health_artifact)
+            .collect(),
+        rollout_summaries: MemoryHealthRolloutSummarySet {
+            directory: map_memory_directory_health(report.rollout_summaries.directory),
+            expected: report
+                .rollout_summaries
+                .expected
+                .into_iter()
+                .map(map_memory_health_rollout_summary)
+                .collect(),
+            stale: report
+                .rollout_summaries
+                .stale
+                .into_iter()
+                .map(map_memory_health_rollout_summary)
+                .collect(),
+        },
+        issues: report
+            .issues
+            .into_iter()
+            .map(map_memory_health_issue)
+            .collect(),
+    }
+}
+
+fn map_memory_directory_health(
+    health: codex_state::MemoryDirectoryHealth,
+) -> MemoryDirectoryHealth {
+    MemoryDirectoryHealth {
+        path: health.path.display().to_string(),
+        exists: health.exists,
+        is_directory: health.is_directory,
+    }
+}
+
+fn map_memory_health_artifact(artifact: codex_state::MemoryHealthArtifact) -> MemoryHealthArtifact {
+    MemoryHealthArtifact {
+        kind: artifact.kind,
+        path: artifact.path.display().to_string(),
+        exists: artifact.exists,
+        is_file: artifact.is_file,
+        readable: artifact.readable,
+        size_bytes: artifact.size_bytes,
+    }
+}
+
+fn map_memory_health_rollout_summary(
+    summary: codex_state::MemoryHealthRolloutSummary,
+) -> MemoryHealthRolloutSummary {
+    MemoryHealthRolloutSummary {
+        file_name: summary.file_name,
+        path: summary.path.display().to_string(),
+        exists: summary.exists,
+        is_file: summary.is_file,
+        readable: summary.readable,
+        size_bytes: summary.size_bytes,
+    }
+}
+
+fn map_memory_health_issue(issue: codex_state::MemoryHealthIssue) -> MemoryHealthIssue {
+    MemoryHealthIssue {
+        severity: match issue.severity {
+            codex_state::MemoryHealthSeverity::Warning => MemoryHealthSeverity::Warning,
+            codex_state::MemoryHealthSeverity::Error => MemoryHealthSeverity::Error,
+        },
+        code: issue.code,
+        message: issue.message,
     }
 }
 

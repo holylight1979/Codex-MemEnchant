@@ -151,6 +151,9 @@ Example with notification opt-out:
 - `thread/turns/list` — page through a stored thread’s turn history without resuming it; supports cursor-based pagination with `sortDirection`, `nextCursor`, and `backwardsCursor`.
 - `thread/metadata/update` — patch stored thread metadata in sqlite; currently supports updating persisted `gitInfo` fields and returns the refreshed `thread`.
 - `thread/memoryMode/set` — experimental; set a thread’s persisted memory eligibility to `"enabled"` or `"disabled"` for either a loaded thread or a stored rollout; returns `{}` on success.
+- `memory/peek` — experimental; inspect recent persisted stage-1 memory outputs without opening files manually. Returns recent entries with thread id, thread/source timestamps, cwd, rollout summary filename, and a short summary excerpt.
+- `memory/health` — experimental; validate the current memory root and artifact layout. Returns structured health data for the memory root, durable artifacts, rollout summaries, and any missing/stale/malformed retrieval sources.
+- `memory/suppress` — experimental; record negative feedback for a persisted stage-1 memory snapshot and suppress it from future phase-2 promotion. Returns the resolved persisted snapshot identity plus the stored reason/timestamps.
 - `memory/reset` — experimental; clear the current `CODEX_HOME/memories` directory and reset persisted memory stage data in sqlite while preserving existing thread memory modes; returns `{}` on success.
 - `thread/status/changed` — notification emitted when a loaded thread’s status changes (`threadId` + new `status`).
 - `thread/archive` — move a thread’s rollout file into the archived directory and attempt to move any spawned descendant thread rollout files; returns `{}` on success and emits `thread/archived` for each archived thread.
@@ -468,6 +471,32 @@ Experimental: use `memory/reset` to clear local memory artifacts and sqlite-back
 ```json
 { "method": "memory/reset", "id": 27 }
 { "id": 27, "result": {} }
+```
+
+Experimental: use `memory/suppress` to record deterministic negative feedback for
+the current persisted stage-1 snapshot of a memory source. The target is
+resolved by `threadId` and can optionally include `sourceUpdatedAt` and
+`rolloutSlug` when the caller wants to assert the exact snapshot identity.
+
+```json
+{ "method": "memory/suppress", "id": 28, "params": {
+  "target": {
+    "threadId": "thr_memory",
+    "sourceUpdatedAt": 1710000100,
+    "rolloutSlug": "fix-memory-selection"
+  },
+  "reason": "wrong_scope"
+} }
+{ "id": 28, "result": {
+  "feedback": {
+    "threadId": "thr_memory",
+    "sourceUpdatedAt": 1710000100,
+    "rolloutSlug": "fix-memory-selection",
+    "reason": "wrong_scope",
+    "createdAt": 1710000200,
+    "updatedAt": 1710000200
+  }
+} }
 ```
 
 ### Example: Archive a thread

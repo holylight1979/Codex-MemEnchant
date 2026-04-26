@@ -5,6 +5,7 @@ use codex_protocol::ThreadId;
 use sqlx::Row;
 use sqlx::sqlite::SqliteRow;
 use std::path::PathBuf;
+use uuid::Uuid;
 
 use super::ThreadMetadata;
 
@@ -35,6 +36,139 @@ pub struct Phase2InputSelection {
     pub previous_selected: Vec<Stage1Output>,
     pub retained_thread_ids: Vec<ThreadId>,
     pub removed: Vec<Stage1OutputRef>,
+}
+
+/// Deterministic heuristic score used to decide whether a session / rollout is
+/// worth retaining, consolidating, or pruning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SessionValueScore {
+    pub total: i64,
+    pub novelty: i64,
+    pub preference_decision_density: i64,
+    pub reusable_command_path_signal: i64,
+    pub failure_recovery_signal: i64,
+    pub completion_citation_signal: i64,
+    pub negative_feedback_penalty: i64,
+    pub duplication_penalty: i64,
+    pub low_information_penalty: i64,
+    pub suppressed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryPeekEntry {
+    pub thread_id: ThreadId,
+    pub thread_updated_at: DateTime<Utc>,
+    pub source_updated_at: DateTime<Utc>,
+    pub generated_at: DateTime<Utc>,
+    pub cwd: PathBuf,
+    pub rollout_summary_file: String,
+    pub summary_excerpt: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryDirectoryHealth {
+    pub path: PathBuf,
+    pub exists: bool,
+    pub is_directory: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryHealthArtifact {
+    pub kind: String,
+    pub path: PathBuf,
+    pub exists: bool,
+    pub is_file: bool,
+    pub readable: bool,
+    pub size_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryHealthRolloutSummary {
+    pub file_name: String,
+    pub path: PathBuf,
+    pub exists: bool,
+    pub is_file: bool,
+    pub readable: bool,
+    pub size_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryHealthSeverity {
+    Warning,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryHealthIssue {
+    pub severity: MemoryHealthSeverity,
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryHealthRolloutSummarySet {
+    pub directory: MemoryDirectoryHealth,
+    pub expected: Vec<MemoryHealthRolloutSummary>,
+    pub stale: Vec<MemoryHealthRolloutSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryHealthReport {
+    pub ok: bool,
+    pub memory_root: MemoryDirectoryHealth,
+    pub artifacts: Vec<MemoryHealthArtifact>,
+    pub rollout_summaries: MemoryHealthRolloutSummarySet,
+    pub issues: Vec<MemoryHealthIssue>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryNegativeFeedbackTarget {
+    pub thread_id: ThreadId,
+    pub source_updated_at: Option<DateTime<Utc>>,
+    pub rollout_slug: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryNegativeFeedbackReason {
+    Transient,
+    IncorrectInference,
+    WrongScope,
+    PrivacySensitive,
+    Duplicate,
+}
+
+impl MemoryNegativeFeedbackReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Transient => "transient",
+            Self::IncorrectInference => "incorrect_inference",
+            Self::WrongScope => "wrong_scope",
+            Self::PrivacySensitive => "privacy_sensitive",
+            Self::Duplicate => "duplicate",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryNegativeFeedbackRecord {
+    pub thread_id: ThreadId,
+    pub source_updated_at: DateTime<Utc>,
+    pub rollout_slug: Option<String>,
+    pub reason: MemoryNegativeFeedbackReason,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryRetrievalRecord {
+    pub thread_id: ThreadId,
+    pub source_updated_at: DateTime<Utc>,
+    pub rollout_slug: Option<String>,
+    pub cwd: PathBuf,
+    pub rollout_path: PathBuf,
+    pub usage_count: i64,
+    pub last_usage: Option<DateTime<Utc>>,
+    pub negative_feedback_reason: Option<MemoryNegativeFeedbackReason>,
 }
 
 #[derive(Debug)]
@@ -99,6 +233,110 @@ pub(crate) fn stage1_output_ref_from_parts(
         source_updated_at: epoch_seconds_to_datetime(source_updated_at)?,
         rollout_slug,
     })
+}
+
+pub(crate) fn memory_negative_feedback_reason_from_str(
+    value: &str,
+) -> Result<MemoryNegativeFeedbackReason> {
+    match value {
+        "transient" => Ok(MemoryNegativeFeedbackReason::Transient),
+        "incorrect_inference" => Ok(MemoryNegativeFeedbackReason::IncorrectInference),
+        "wrong_scope" => Ok(MemoryNegativeFeedbackReason::WrongScope),
+        "privacy_sensitive" => Ok(MemoryNegativeFeedbackReason::PrivacySensitive),
+        "duplicate" => Ok(MemoryNegativeFeedbackReason::Duplicate),
+        _ => anyhow::bail!("unknown memory negative feedback reason: {value}"),
+    }
+}
+
+pub(crate) fn rollout_summary_file_name_from_parts(
+    thread_id: ThreadId,
+    source_updated_at: DateTime<Utc>,
+    rollout_slug: Option<&str>,
+) -> String {
+    format!(
+        "{}.md",
+        rollout_summary_file_stem_from_parts(thread_id, source_updated_at, rollout_slug)
+    )
+}
+
+fn rollout_summary_file_stem_from_parts(
+    thread_id: ThreadId,
+    source_updated_at: DateTime<Utc>,
+    rollout_slug: Option<&str>,
+) -> String {
+    const ROLLOUT_SLUG_MAX_LEN: usize = 60;
+    const SHORT_HASH_ALPHABET: &[u8; 62] =
+        b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    const SHORT_HASH_SPACE: u32 = 14_776_336;
+
+    let thread_id = thread_id.to_string();
+    let (timestamp_fragment, short_hash_seed) = match Uuid::parse_str(&thread_id) {
+        Ok(thread_uuid) => {
+            let timestamp = thread_uuid
+                .get_timestamp()
+                .and_then(|uuid_timestamp| {
+                    let (seconds, nanos) = uuid_timestamp.to_unix();
+                    i64::try_from(seconds)
+                        .ok()
+                        .and_then(|secs| DateTime::<Utc>::from_timestamp(secs, nanos))
+                })
+                .unwrap_or(source_updated_at);
+            let short_hash_seed = (thread_uuid.as_u128() & 0xFFFF_FFFF) as u32;
+            (
+                timestamp.format("%Y-%m-%dT%H-%M-%S").to_string(),
+                short_hash_seed,
+            )
+        }
+        Err(_) => {
+            let mut short_hash_seed = 0u32;
+            for byte in thread_id.bytes() {
+                short_hash_seed = short_hash_seed
+                    .wrapping_mul(31)
+                    .wrapping_add(u32::from(byte));
+            }
+            (
+                source_updated_at.format("%Y-%m-%dT%H-%M-%S").to_string(),
+                short_hash_seed,
+            )
+        }
+    };
+
+    let mut short_hash_value = short_hash_seed % SHORT_HASH_SPACE;
+    let mut short_hash_chars = ['0'; 4];
+    for idx in (0..short_hash_chars.len()).rev() {
+        let alphabet_idx = (short_hash_value % SHORT_HASH_ALPHABET.len() as u32) as usize;
+        short_hash_chars[idx] = SHORT_HASH_ALPHABET[alphabet_idx] as char;
+        short_hash_value /= SHORT_HASH_ALPHABET.len() as u32;
+    }
+    let short_hash: String = short_hash_chars.iter().collect();
+    let file_prefix = format!("{timestamp_fragment}-{short_hash}");
+
+    let Some(raw_slug) = rollout_slug else {
+        return file_prefix;
+    };
+
+    let mut slug = String::with_capacity(ROLLOUT_SLUG_MAX_LEN);
+    for ch in raw_slug.chars() {
+        if slug.len() >= ROLLOUT_SLUG_MAX_LEN {
+            break;
+        }
+
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+        } else {
+            slug.push('_');
+        }
+    }
+
+    while slug.ends_with('_') {
+        slug.pop();
+    }
+
+    if slug.is_empty() {
+        file_prefix
+    } else {
+        format!("{file_prefix}-{slug}")
+    }
 }
 
 /// Result of trying to claim a stage-1 memory extraction job.

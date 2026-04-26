@@ -235,6 +235,22 @@ Rules:
 - No prose outside JSON.
 
 ============================================================
+EPISODIC VS DURABLE SEPARATION
+============================================================
+
+- `rollout_summary` and `raw_memory` are session-derived episodic artifacts, not durable memory
+  by themselves.
+- `rollout_summary` is the more permissive evidence record.
+  - Keep richer run-local detail, provenance, and recency-sensitive context there when it may
+    help a future agent revisit or audit this rollout.
+- `raw_memory` is a structured promotion candidate for Phase 2.
+  - Keep it focused on signals that might deserve durable promotion later: user preferences,
+    routing boundaries, reusable knowledge, decision triggers, failure shields, and exact
+    retrieval handles.
+- Do not assume that everything saved in `rollout_summary` or `raw_memory` belongs later in
+  `MEMORY.md` or `memory_summary.md`.
+
+============================================================
 `rollout_summary` FORMAT
 ============================================================
 
@@ -254,6 +270,8 @@ Important judgment rules:
 
 - Rollout summaries may be more permissive than durable memory, because they are reference
   artifacts for future agents who may want to execute or revisit what was discussed.
+- Preserve useful one-run evidence here even when it would be too transient, too detailed, or too
+  narrow for durable memory.
 - The rollout summary should preserve enough evidence and nuance that a future agent can see
   how a conclusion was reached, not just the conclusion itself.
 - Preserve epistemic status when it matters. Make it clear whether something was verified
@@ -422,15 +440,29 @@ task_outcome: <success|partial|fail|uncertain>
 Preference signals:
 - when <situation>, the user said / asked / corrected: "<short quote or near-verbatim request>" -> <what that suggests for similar future runs>
 - <split distinct defaults into separate bullets; do not collapse multiple concrete requests into one umbrella summary>
+- If there is no durable preference signal for this task, still keep this heading and write `- none`.
+
+Decision signals:
+- <decision trigger, acceptance rule, or pivot condition that future agents should preserve>
+- <what made one path acceptable/rejected, what the user explicitly prioritized, or what should cause a pivot next time>
+- If there is no meaningful decision signal for this task, still keep this heading and write `- none`.
+
+Scope and cwd notes:
+- <primary cwd / checkout boundary / scope note that affects reuse>
+- <secondary cwd, branch, or environment caveat only when it matters for retrieval or safe reuse>
+- If there is no extra scope note beyond the top-level `cwd`, still keep this heading and write `- none`.
 
 Reusable knowledge:
 - <validated repo fact, procedural shortcut, or durable takeaway>
+- If there is no reusable knowledge worth saving for this task, still keep this heading and write `- none`.
 
 Failures and how to do differently:
 - <what failed, what pivot worked, and how to avoid repeating it>
+- If there was no meaningful failure mode, still keep this heading and write `- none`.
 
-References:
+High-value commands or paths:
 - <verbatim strings and artifacts a future agent should be able to reuse directly: full commands with flags, exact ids, file paths, function names, error strings, user wording, or other retrieval handles worth preserving verbatim>
+- If there are no high-value commands or paths, still keep this heading and write `- none`.
 
 ### Task 2: <short task name> (if needed)
 
@@ -441,28 +473,51 @@ task_outcome: ...
 Preference signals:
 - ... -> ...
 
+Decision signals:
+- ...
+
+Scope and cwd notes:
+- ...
+
 Reusable knowledge:
 - ...
 
 Failures and how to do differently:
 - ...
 
-References:
+High-value commands or paths:
 - ...
 
 Preferred task-block body shape (strongly recommended):
 
 - `### Task <n>` blocks should preserve task-specific retrieval signal and consolidation-ready detail.
-- Include a `Preference signals:` subsection inside each task when that task contains meaningful
-  user-preference evidence.
+- Every task block MUST contain the same fixed subsections in this order:
+  - `Preference signals:`
+  - `Decision signals:`
+  - `Scope and cwd notes:`
+  - `Reusable knowledge:`
+  - `Failures and how to do differently:`
+  - `High-value commands or paths:`
+- If a subsection has no meaningful content, keep the heading and write `- none` instead of
+  omitting the section.
 - Within each task block, include:
   - `Preference signals:` for evidence plus implication on the same line when meaningful,
+  - `Decision signals:` for decision triggers, acceptance criteria, pivot conditions, and
+    explicit workflow choices the user made or reinforced,
+  - `Scope and cwd notes:` for checkout boundaries, primary/secondary cwd details, and scope
+    caveats that affect retrieval or safe reuse,
   - `Reusable knowledge:` for validated repo/system facts and high-leverage procedural knowledge,
   - `Failures and how to do differently:` for pivots, prevention rules, and failure shields,
-  - `References:` for verbatim retrieval strings and artifacts a future agent may want to reuse directly, such as full commands with flags, exact ids, file paths, function names, error strings, and important user wording.
+  - `High-value commands or paths:` for verbatim retrieval strings and artifacts a future agent may
+    want to reuse directly, such as full commands with flags, exact ids, file paths, function names,
+    error strings, and important user wording.
 - When a bullet depends on interpretation, make the source of that interpretation legible
   in the sentence rather than implying more certainty than the rollout supports.
 - `Preference signals:` is for evidence plus implication, not just a compressed conclusion.
+- `Decision signals:` is for routing and action selection:
+  - what the user accepted or rejected,
+  - what future agents should check before proceeding,
+  - what evidence or condition should trigger a pivot.
 - Preference signals should be quote-oriented when possible:
   - what happened / what the user said
   - what that implies for similar future runs
@@ -487,7 +542,8 @@ Task grouping rules (strict):
   rather than storing multiple primary cwd values in one raw memory.
 
 What to write in memory entries: Extract useful takeaways from the rollout summaries,
-especially from "Preference signals", "Reusable knowledge", "References", and
+especially from "Preference signals", "Decision signals", "Scope and cwd notes",
+"Reusable knowledge", "High-value commands or paths", and
 "Failures and how to do differently".
 Write what would help a future agent doing a similar (or adjacent) task while minimizing
 future user correction and interruption: preference evidence, likely user defaults, decision triggers,
@@ -516,6 +572,8 @@ Be more conservative here than in the rollout summary:
 
 - Preserve preference evidence inside the task where it appeared; let Phase 2 decide whether
   repeated signals add up to a stable user preference.
+- Prefer content that could plausibly change future default behavior. If a point mainly helps a
+  future agent reconstruct this rollout, it likely belongs only in `rollout_summary`.
 - Prefer user-preference evidence and high-leverage reusable knowledge over routine task recap.
 - Include procedural details mainly when they are unusually valuable and likely to save
   substantial future exploration time.

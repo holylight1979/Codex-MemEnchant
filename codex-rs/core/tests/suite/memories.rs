@@ -299,6 +299,64 @@ async fn memories_startup_phase2_processes_old_extension_resources_without_stage
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn memories_startup_phase2_materializes_structured_phase1_outputs_for_consolidation()
+-> Result<()> {
+    let server = start_mock_server().await;
+    let home = Arc::new(TempDir::new()?);
+    let db = init_state_db(&home).await?;
+
+    let now = Utc::now();
+    let thread_id = seed_stage1_output(
+        db.as_ref(),
+        home.path(),
+        now - ChronoDuration::hours(1),
+        &structured_phase1_raw_memory(),
+        &structured_phase1_rollout_summary(),
+        "structured-phase1",
+    )
+    .await?;
+
+    let phase2 = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-phase2-structured"),
+            ev_assistant_message("msg-phase2-structured", "phase2 complete"),
+            ev_completed("resp-phase2-structured"),
+        ]),
+    )
+    .await;
+
+    let codex = build_test_codex(&server, home.clone()).await?;
+    let request = wait_for_single_request(&phase2).await;
+    let prompt = phase2_prompt_text(&request);
+    assert!(
+        prompt.contains(&format!("- [added] thread_id={thread_id},")),
+        "expected structured phase1 thread to be selected: {prompt}"
+    );
+
+    wait_for_phase2_success(db.as_ref(), thread_id).await?;
+    let memory_root = home.path().join("memories");
+    let raw_memories = tokio::fs::read_to_string(memory_root.join("raw_memories.md")).await?;
+    assert!(raw_memories.contains("Preference signals:"));
+    assert!(raw_memories.contains("Decision signals:"));
+    assert!(raw_memories.contains("Scope and cwd notes:"));
+    assert!(raw_memories.contains("High-value commands or paths:"));
+    assert!(raw_memories.contains(
+        "the user asked to strengthen preference extraction without starting schema migration"
+    ));
+    assert!(raw_memories.contains("cargo test -p codex-core validate_stage_one_output"));
+
+    let rollout_summaries = read_rollout_summary_bodies(&memory_root).await?;
+    assert_eq!(rollout_summaries.len(), 1);
+    assert!(rollout_summaries[0].contains("## Task 1: Validate phase-1 memory structure"));
+    assert!(rollout_summaries[0].contains("Preference signals:"));
+    assert!(rollout_summaries[0].contains("Decision signals:"));
+
+    shutdown_test_codex(&codex).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn web_search_pollution_moves_selected_thread_into_removed_phase2_inputs() -> Result<()> {
     let server = start_mock_server().await;
     let home = Arc::new(TempDir::new()?);
@@ -560,7 +618,7 @@ fn phase2_prompt_text(request: &ResponsesRequest) -> String {
     request
         .message_input_texts("user")
         .into_iter()
-        .find(|text| text.contains("Current selected Phase 1 inputs:"))
+        .find(|text| text.contains("Current selected Phase 1 inputs"))
         .expect("phase2 prompt text")
 }
 
@@ -623,6 +681,64 @@ async fn seed_stage1_output_for_existing_thread(
     );
 
     Ok(())
+}
+
+fn structured_phase1_raw_memory() -> String {
+    "\
+---
+description: Captured stronger phase-1 preference and decision extraction for the memory workstream
+task: codex-memory-p0-2
+task_group: codex-memory
+task_outcome: success
+cwd: C:\\CodexSource\\codex
+keywords: codex-memory, phase1, preference-signals, decision-signals, cwd-scope
+---
+
+### Task 1: Validate phase-1 memory structure
+
+task: validate-phase1-memory-structure
+task_group: codex-memory
+task_outcome: success
+
+Preference signals:
+- when implementing memory work, the user asked to strengthen preference extraction without starting schema migration -> favor prompt and validator changes before schema work on similar tasks
+
+Decision signals:
+- preserve task-level decision triggers so Phase 2 can promote reusable workflow choices without rereading full rollouts
+
+Scope and cwd notes:
+- primary cwd is `C:\\CodexSource\\codex`; keep this guidance scoped to the current Codex checkout
+
+Reusable knowledge:
+- a fixed task-block skeleton makes raw memories easier to consolidate and grep than free-form markdown
+
+Failures and how to do differently:
+- avoid accepting prose-only raw memories because they hide preference and decision evidence inside broad summaries
+
+High-value commands or paths:
+- `cargo test -p codex-core validate_stage_one_output`
+- `C:\\CodexSource\\codex\\codex-rs\\core\\templates\\memories\\stage_one_system.md`
+"
+    .to_string()
+}
+
+fn structured_phase1_rollout_summary() -> String {
+    "\
+# Harden phase-1 preference and decision extraction
+
+Rollout context: improve Codex memory extraction without starting DB schema migration.
+
+## Task 1: Validate phase-1 memory structure
+
+Outcome: success
+
+Preference signals:
+- the user asked to focus on prompt and Phase 1 output structure first instead of broad schema work
+
+Decision signals:
+- a fixed task-block skeleton is the acceptance rule for this phase
+"
+    .to_string()
 }
 
 async fn read_rollout_summary_bodies(memory_root: &Path) -> Result<Vec<String>> {

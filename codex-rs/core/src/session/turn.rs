@@ -31,6 +31,7 @@ use crate::injection::app_id_from_path;
 use crate::injection::tool_kind_for_path;
 use crate::mcp_skill_dependencies::maybe_prompt_and_install_mcp_dependencies;
 use crate::mcp_tool_exposure::build_mcp_tool_exposure;
+use crate::memories::prompts::build_memory_retrieval_developer_message;
 use crate::mentions::build_connector_slug_counts;
 use crate::mentions::build_skill_name_counts;
 use crate::mentions::collect_explicit_app_ids;
@@ -375,6 +376,9 @@ pub(crate) async fn run_turn(
     // 1. At the start of a turn, so the fresh user prompt in `input` gets sampled first.
     // 2. After auto-compact, when model/tool continuation needs to resume before any steer.
     let mut can_drain_pending_input = input.is_empty();
+    let mut pre_turn_memory_retrieval_item =
+        maybe_build_pre_turn_memory_retrieval_item(sess.as_ref(), turn_context.as_ref(), &input)
+            .await;
 
     loop {
         if run_pending_session_start_hooks(&sess, &turn_context).await {
@@ -432,9 +436,15 @@ pub(crate) async fn run_turn(
 
         // Construct the input that we will send to the model.
         let sampling_request_input: Vec<ResponseItem> = {
-            sess.clone_history()
+            let input_for_prompt = sess
+                .clone_history()
                 .await
-                .for_prompt(&turn_context.model_info.input_modalities)
+                .for_prompt(&turn_context.model_info.input_modalities);
+            if let Some(memory_item) = pre_turn_memory_retrieval_item.take() {
+                inject_pre_turn_memory_retrieval(input_for_prompt, &input, memory_item)
+            } else {
+                input_for_prompt
+            }
         };
 
         let sampling_request_input_messages = sampling_request_input
@@ -972,6 +982,59 @@ pub(crate) fn build_prompt(
             &turn_context.session_source,
         ),
     }
+}
+
+async fn maybe_build_pre_turn_memory_retrieval_item(
+    sess: &Session,
+    turn_context: &TurnContext,
+    input: &[UserInput],
+) -> Option<ResponseItem> {
+    if input.is_empty()
+        || !turn_context.features.enabled(Feature::MemoryTool)
+        || !turn_context.config.memories.use_memories
+    {
+        return None;
+    }
+
+    let retrieval_bundle = build_memory_retrieval_developer_message(
+        sess.services.state_db.as_deref(),
+        &turn_context.config.codex_home,
+        &turn_context.cwd,
+        input,
+    )
+    .await?;
+    crate::context_manager::updates::build_developer_update_item(vec![retrieval_bundle])
+}
+
+fn inject_pre_turn_memory_retrieval(
+    mut prompt_input: Vec<ResponseItem>,
+    current_input: &[UserInput],
+    developer_item: ResponseItem,
+) -> Vec<ResponseItem> {
+    let current_user_prompt: ResponseItem = ResponseInputItem::from(current_input.to_vec()).into();
+    if let Some(user_index) = prompt_input
+        .iter()
+        .rposition(|item| item == &current_user_prompt)
+    {
+        let insert_at = prompt_input[..user_index]
+            .iter()
+            .enumerate()
+            .rfind(
+                |(_, item)| matches!(item, ResponseItem::Message { role, .. } if role == "developer"),
+            )
+            .and_then(|(index, _)| {
+                prompt_input[index + 1..user_index]
+                    .iter()
+                    .all(|item| matches!(item, ResponseItem::Message { role, .. } if role == "user"))
+                    .then_some(index + 1)
+            })
+            .unwrap_or(user_index);
+        prompt_input.insert(insert_at, developer_item);
+        return prompt_input;
+    }
+
+    prompt_input.push(developer_item);
+    prompt_input
 }
 
 fn filter_deferred_dynamic_tool_spec(

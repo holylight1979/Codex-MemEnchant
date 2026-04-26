@@ -47,7 +47,15 @@ What it does:
   - a detailed `raw_memory`
   - a compact `rollout_summary`
   - an optional `rollout_slug`
+- requires `raw_memory` task blocks to use a fixed Phase 1 skeleton:
+  - `Preference signals:`
+  - `Decision signals:`
+  - `Scope and cwd notes:`
+  - `Reusable knowledge:`
+  - `Failures and how to do differently:`
+  - `High-value commands or paths:`
 - redacts secrets from the generated memory fields
+- validates the stage-1 output structure before persisting it
 - stores successful outputs back into the state DB as stage-1 outputs
 
 Concurrency / coordination:
@@ -77,8 +85,19 @@ What it does:
     `max_unused_days` window
   - for memories with no `last_usage`, falls back to `generated_at` so fresh
     never-used memories can still be selected
-  - ranks eligible memories by `usage_count` first, then by the most recent
-    `last_usage` / `generated_at`
+  - computes a deterministic session-value score from:
+    - novelty in structured Phase-1 bullets
+    - preference / decision density
+    - reusable command / path signals
+    - failure-and-recovery signals
+    - successful completion and observed citation signals from
+      `usage_count` / `last_usage`
+    - negative feedback / suppression
+    - duplicate-session penalties within the current candidate set
+    - low-information penalties
+  - ranks eligible memories by session-value score first, then uses
+    `usage_count` and the most recent `last_usage` / `generated_at` as
+    deterministic tie-breakers
 - computes a completion watermark from the claimed watermark + newest input timestamps
 - syncs local memory artifacts under the memories root:
   - `raw_memories.md` (merged raw memories, latest first)
@@ -100,6 +119,11 @@ If there is input, it then:
 - runs it with no approvals, no network, and local write access only
 - disables collab for that agent (to prevent recursive delegation)
 - watches the agent status and heartbeats the global job lease while it runs
+- runs a deterministic post-consolidation artifact validator before
+  recording Phase 2 success
+- fails the Phase 2 job instead of finalizing success when the validator
+  detects missing/degenerate durable artifacts or rollout-reference
+  mismatches
 - marks the phase-2 job success/failure in the state DB when the agent finishes
 - prunes old extension resource files after the consolidation agent completes
   and the successful Phase 2 job is recorded
@@ -120,6 +144,9 @@ Selection diff behavior:
 - before the agent starts, local `rollout_summaries/` and `raw_memories.md`
   keep the union of the current selection and the previous successful
   selection, so removed-thread evidence stays available during forgetting
+- stale retention also reuses the session-value score so maintenance prunes
+  low-value / duplicate / suppressed stale memories before older but richer
+  ones
 
 Watermark behavior:
 
@@ -131,6 +158,46 @@ Watermark behavior:
 - This lets later phase-2 runs know whether new stage-1 data arrived since the last successful consolidation (dirty vs not dirty), while also avoiding moving the watermark backwards.
 
 In practice, this phase is responsible for refreshing the on-disk memory workspace and producing/updating the higher-level consolidated memory outputs.
+
+Artifact roles and retrieval policy:
+
+- Durable artifacts:
+  - `MEMORY.md`
+  - `memory_summary.md`
+  - optional `skills/*`
+- Episodic artifacts:
+  - `raw_memories.md`
+  - `rollout_summaries/*.md`
+- Phase 2 uses episodic artifacts as evidence inputs, but should promote only reusable,
+  stable guidance into durable artifacts.
+- Pre-turn retrieval now treats the two classes differently:
+  - durable memory is injected first and acts as the default behavioral baseline
+  - episodic evidence is injected only when it is strongly tied to the current task,
+    cwd, or explicit path mentions
+  - ranking is deterministic and now combines lexical matches, cwd/path scope,
+    durable-vs-episodic source bias, usage/recency metadata when available, and
+    stale / suppression penalties
+  - episodic evidence should support or audit a likely match, not silently become a
+    durable default
+- A useful rule of thumb:
+  - if the point mainly helps reconstruct one prior run, keep it in episodic artifacts
+  - if the point should change future default behavior, it is a candidate for durable memory
+
+Post-consolidation validator coverage currently checks:
+
+- `MEMORY.md` exists for non-empty Phase 2 artifact inputs
+- `memory_summary.md` exists for non-empty Phase 2 artifact inputs
+- `raw_memories.md` exists and is not still the empty placeholder when
+  inputs exist
+- every rollout summary file expected from the current materialized
+  phase-2 artifact set exists under `rollout_summaries/`
+- `MEMORY.md` references only rollout summary files that exist in the
+  current materialized set
+- current materialized rollout summaries are not silently omitted from
+  `MEMORY.md`
+- durable artifacts do not directly reference `raw_memories.md`
+- `MEMORY.md` / `memory_summary.md` are not empty or obviously
+  degenerate
 
 ## Why it is split into two phases
 

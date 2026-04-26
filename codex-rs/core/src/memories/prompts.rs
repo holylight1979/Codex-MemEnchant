@@ -3,11 +3,15 @@ use crate::memories::extensions::RemovedExtensionResource;
 use crate::memories::memory_extensions_root;
 use crate::memories::memory_root;
 use crate::memories::phase_one;
+use crate::memories::retrieval::render_memory_retrieval_bundle;
+use crate::memories::retrieval::retrieve_memory_snippets;
 use crate::memories::storage::rollout_summary_file_stem_from_parts;
 use codex_protocol::openai_models::ModelInfo;
+use codex_protocol::user_input::UserInput;
 use codex_state::Phase2InputSelection;
 use codex_state::Stage1Output;
 use codex_state::Stage1OutputRef;
+use codex_state::StateRuntime;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::truncate_text;
@@ -173,7 +177,7 @@ fn render_phase2_input_selection(
     };
 
     let mut rendered = format!(
-        "- selected inputs this run: {}\n- newly added since the last successful Phase 2 run: {added}\n- retained from the last successful Phase 2 run: {retained}\n- removed from the last successful Phase 2 run: {}\n\nCurrent selected Phase 1 inputs:\n{selected}\n\nRemoved from the last successful Phase 2 selection:\n{removed}\n",
+        "- selected inputs this run: {}\n- newly added since the last successful Phase 2 run: {added}\n- retained from the last successful Phase 2 run: {retained}\n- removed from the last successful Phase 2 run: {}\n\nCurrent selected Phase 1 inputs (episodic evidence candidates for this run):\n{selected}\n\nRemoved from the last successful Phase 2 selection (episodic evidence that may need durable-memory cleanup):\n{removed}\n",
         selection.selected.len(),
         selection.removed.len(),
     );
@@ -286,6 +290,18 @@ pub(crate) async fn build_memory_tool_developer_instructions(
             ("memory_summary", memory_summary.as_str()),
         ])
         .ok()
+}
+
+pub(crate) async fn build_memory_retrieval_developer_message(
+    state_db: Option<&StateRuntime>,
+    codex_home: &AbsolutePathBuf,
+    cwd: &Path,
+    input: &[UserInput],
+) -> Option<String> {
+    let snippets = retrieve_memory_snippets(state_db, codex_home, cwd, input)
+        .await
+        .ok()?;
+    render_memory_retrieval_bundle(&snippets)
 }
 
 #[cfg(test)]

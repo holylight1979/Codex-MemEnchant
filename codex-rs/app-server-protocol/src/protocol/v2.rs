@@ -3826,6 +3826,154 @@ pub struct ThreadMemoryModeSetResponse {}
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
+pub struct MemoryPeekEntry {
+    pub thread_id: String,
+    #[ts(type = "number")]
+    pub thread_updated_at: i64,
+    #[ts(type = "number")]
+    pub source_updated_at: i64,
+    #[ts(type = "number")]
+    pub generated_at: i64,
+    pub cwd: String,
+    pub rollout_summary_file: String,
+    pub summary_excerpt: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct MemoryPeekResponse {
+    pub entries: Vec<MemoryPeekEntry>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "lowercase")]
+#[ts(rename_all = "lowercase", export_to = "v2/")]
+pub enum MemoryHealthSeverity {
+    Warning,
+    Error,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct MemoryDirectoryHealth {
+    pub path: String,
+    pub exists: bool,
+    pub is_directory: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct MemoryHealthArtifact {
+    pub kind: String,
+    pub path: String,
+    pub exists: bool,
+    pub is_file: bool,
+    pub readable: bool,
+    #[ts(type = "number | null")]
+    pub size_bytes: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct MemoryHealthRolloutSummary {
+    pub file_name: String,
+    pub path: String,
+    pub exists: bool,
+    pub is_file: bool,
+    pub readable: bool,
+    #[ts(type = "number | null")]
+    pub size_bytes: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct MemoryHealthRolloutSummarySet {
+    pub directory: MemoryDirectoryHealth,
+    pub expected: Vec<MemoryHealthRolloutSummary>,
+    pub stale: Vec<MemoryHealthRolloutSummary>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct MemoryHealthIssue {
+    pub severity: MemoryHealthSeverity,
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct MemoryHealthResponse {
+    pub ok: bool,
+    pub memory_root: MemoryDirectoryHealth,
+    pub artifacts: Vec<MemoryHealthArtifact>,
+    pub rollout_summaries: MemoryHealthRolloutSummarySet,
+    pub issues: Vec<MemoryHealthIssue>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case", export_to = "v2/")]
+pub enum MemoryNegativeFeedbackReason {
+    Transient,
+    IncorrectInference,
+    WrongScope,
+    PrivacySensitive,
+    Duplicate,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct MemoryNegativeFeedbackTarget {
+    pub thread_id: String,
+    #[ts(type = "number | null")]
+    pub source_updated_at: Option<i64>,
+    #[ts(optional = nullable)]
+    pub rollout_slug: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct MemoryNegativeFeedbackRecord {
+    pub thread_id: String,
+    #[ts(type = "number")]
+    pub source_updated_at: i64,
+    #[ts(optional = nullable)]
+    pub rollout_slug: Option<String>,
+    pub reason: MemoryNegativeFeedbackReason,
+    #[ts(type = "number")]
+    pub created_at: i64,
+    #[ts(type = "number")]
+    pub updated_at: i64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct MemorySuppressParams {
+    pub target: MemoryNegativeFeedbackTarget,
+    pub reason: MemoryNegativeFeedbackReason,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct MemorySuppressResponse {
+    pub feedback: MemoryNegativeFeedbackRecord,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
 pub struct MemoryResetResponse {}
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -10549,6 +10697,157 @@ mod tests {
             err.to_string()
                 .contains("AbsolutePathBuf deserialized without a base path"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn memory_peek_response_serializes_entries_in_camel_case() {
+        let value = serde_json::to_value(MemoryPeekResponse {
+            entries: vec![MemoryPeekEntry {
+                thread_id: "thread_123".to_string(),
+                thread_updated_at: 10,
+                source_updated_at: 9,
+                generated_at: 11,
+                cwd: "/tmp/workspace".to_string(),
+                rollout_summary_file: "rollout_summaries/test.md".to_string(),
+                summary_excerpt: "summary".to_string(),
+            }],
+        })
+        .expect("serialize memory peek response");
+
+        assert_eq!(
+            value,
+            json!({
+                "entries": [
+                    {
+                        "threadId": "thread_123",
+                        "threadUpdatedAt": 10,
+                        "sourceUpdatedAt": 9,
+                        "generatedAt": 11,
+                        "cwd": "/tmp/workspace",
+                        "rolloutSummaryFile": "rollout_summaries/test.md",
+                        "summaryExcerpt": "summary"
+                    }
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn memory_health_response_serializes_nested_health_shapes() {
+        let value = serde_json::to_value(MemoryHealthResponse {
+            ok: false,
+            memory_root: MemoryDirectoryHealth {
+                path: "/tmp/memories".to_string(),
+                exists: true,
+                is_directory: true,
+            },
+            artifacts: vec![MemoryHealthArtifact {
+                kind: "memory".to_string(),
+                path: "/tmp/memories/MEMORY.md".to_string(),
+                exists: false,
+                is_file: false,
+                readable: false,
+                size_bytes: None,
+            }],
+            rollout_summaries: MemoryHealthRolloutSummarySet {
+                directory: MemoryDirectoryHealth {
+                    path: "/tmp/memories/rollout_summaries".to_string(),
+                    exists: true,
+                    is_directory: true,
+                },
+                expected: vec![MemoryHealthRolloutSummary {
+                    file_name: "expected.md".to_string(),
+                    path: "/tmp/memories/rollout_summaries/expected.md".to_string(),
+                    exists: false,
+                    is_file: false,
+                    readable: false,
+                    size_bytes: None,
+                }],
+                stale: vec![],
+            },
+            issues: vec![MemoryHealthIssue {
+                severity: MemoryHealthSeverity::Error,
+                code: "missing_memory".to_string(),
+                message: "missing".to_string(),
+            }],
+        })
+        .expect("serialize memory health response");
+
+        assert_eq!(
+            value,
+            json!({
+                "ok": false,
+                "memoryRoot": {
+                    "path": "/tmp/memories",
+                    "exists": true,
+                    "isDirectory": true
+                },
+                "artifacts": [
+                    {
+                        "kind": "memory",
+                        "path": "/tmp/memories/MEMORY.md",
+                        "exists": false,
+                        "isFile": false,
+                        "readable": false,
+                        "sizeBytes": null
+                    }
+                ],
+                "rolloutSummaries": {
+                    "directory": {
+                        "path": "/tmp/memories/rollout_summaries",
+                        "exists": true,
+                        "isDirectory": true
+                    },
+                    "expected": [
+                        {
+                            "fileName": "expected.md",
+                            "path": "/tmp/memories/rollout_summaries/expected.md",
+                            "exists": false,
+                            "isFile": false,
+                            "readable": false,
+                            "sizeBytes": null
+                        }
+                    ],
+                    "stale": []
+                },
+                "issues": [
+                    {
+                        "severity": "error",
+                        "code": "missing_memory",
+                        "message": "missing"
+                    }
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn memory_suppress_response_serializes_feedback_record() {
+        let value = serde_json::to_value(MemorySuppressResponse {
+            feedback: MemoryNegativeFeedbackRecord {
+                thread_id: "thread_123".to_string(),
+                source_updated_at: 99,
+                rollout_slug: Some("task".to_string()),
+                reason: MemoryNegativeFeedbackReason::WrongScope,
+                created_at: 100,
+                updated_at: 101,
+            },
+        })
+        .expect("serialize memory suppress response");
+
+        assert_eq!(
+            value,
+            json!({
+                "feedback": {
+                    "threadId": "thread_123",
+                    "sourceUpdatedAt": 99,
+                    "rolloutSlug": "task",
+                    "reason": "wrong_scope",
+                    "createdAt": 100,
+                    "updatedAt": 101
+                }
+            })
         );
     }
 }

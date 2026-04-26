@@ -14,8 +14,21 @@ mod runtime;
 pub use model::LogEntry;
 pub use model::LogQuery;
 pub use model::LogRow;
+pub use model::MemoryDirectoryHealth;
+pub use model::MemoryHealthArtifact;
+pub use model::MemoryHealthIssue;
+pub use model::MemoryHealthReport;
+pub use model::MemoryHealthRolloutSummary;
+pub use model::MemoryHealthRolloutSummarySet;
+pub use model::MemoryHealthSeverity;
+pub use model::MemoryNegativeFeedbackReason;
+pub use model::MemoryNegativeFeedbackRecord;
+pub use model::MemoryNegativeFeedbackTarget;
+pub use model::MemoryPeekEntry;
+pub use model::MemoryRetrievalRecord;
 pub use model::Phase2InputSelection;
 pub use model::Phase2JobClaimOutcome;
+pub use model::SessionValueScore;
 /// Preferred entrypoint: owns configuration and metrics.
 pub use runtime::StateRuntime;
 
@@ -61,7 +74,7 @@ pub const SQLITE_HOME_ENV: &str = "CODEX_SQLITE_HOME";
 pub const LOGS_DB_FILENAME: &str = "logs";
 pub const LOGS_DB_VERSION: u32 = 2;
 pub const STATE_DB_FILENAME: &str = "state";
-pub const STATE_DB_VERSION: u32 = 5;
+pub const STATE_DB_VERSION: u32 = 6;
 
 /// Errors encountered during DB operations. Tags: [stage]
 pub const DB_ERROR_METRIC: &str = "codex.db.error";

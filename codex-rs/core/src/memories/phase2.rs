@@ -11,6 +11,7 @@ use crate::memories::prompts::build_consolidation_prompt;
 use crate::memories::storage::rebuild_raw_memories_file_from_memories;
 use crate::memories::storage::rollout_summary_file_stem;
 use crate::memories::storage::sync_rollout_summaries_from_memories;
+use crate::memories::validate::validate_post_consolidation_artifacts;
 use crate::session::emit_subagent_session_started;
 use crate::session::session::Session;
 use codex_config::Constrained;
@@ -94,24 +95,30 @@ pub(super) async fn run(session: &Arc<Session>, config: Arc<Config>) {
         }
     };
     let raw_memories = selection.selected.to_vec();
-    let artifact_memories = artifact_memories_for_phase2(&selection);
+    let episodic_artifact_memories = episodic_artifact_memories_for_phase2(&selection);
     let new_watermark = get_watermark(claim.watermark, &raw_memories);
 
     // 4. Update the file system by syncing the raw memories with the one extracted from DB at
     //    step 3
     // [`rollout_summaries/`]
-    if let Err(err) =
-        sync_rollout_summaries_from_memories(&root, &artifact_memories, artifact_memories.len())
-            .await
+    if let Err(err) = sync_rollout_summaries_from_memories(
+        &root,
+        &episodic_artifact_memories,
+        episodic_artifact_memories.len(),
+    )
+    .await
     {
         tracing::error!("failed syncing local memory artifacts for global consolidation: {err}");
         job::failed(session, db, &claim, "failed_sync_artifacts").await;
         return;
     }
     // [`raw_memories.md`]
-    if let Err(err) =
-        rebuild_raw_memories_file_from_memories(&root, &artifact_memories, artifact_memories.len())
-            .await
+    if let Err(err) = rebuild_raw_memories_file_from_memories(
+        &root,
+        &episodic_artifact_memories,
+        episodic_artifact_memories.len(),
+    )
+    .await
     {
         tracing::error!("failed syncing local memory artifacts for global consolidation: {err}");
         job::failed(session, db, &claim, "failed_rebuild_raw_memories").await;
@@ -177,8 +184,10 @@ pub(super) async fn run(session: &Arc<Session>, config: Arc<Config>) {
     agent::handle(
         session,
         claim,
+        root,
         new_watermark,
         raw_memories.clone(),
+        episodic_artifact_memories,
         pending_extension_resource_removals,
         thread_id,
         agent_control,
@@ -192,7 +201,7 @@ pub(super) async fn run(session: &Arc<Session>, config: Arc<Config>) {
     emit_metrics(session, counters);
 }
 
-fn artifact_memories_for_phase2(
+fn episodic_artifact_memories_for_phase2(
     selection: &codex_state::Phase2InputSelection,
 ) -> Vec<Stage1Output> {
     let mut seen = HashSet::new();
@@ -366,8 +375,10 @@ mod agent {
     pub(super) fn handle(
         session: &Arc<Session>,
         claim: Claim,
+        root: codex_utils_absolute_path::AbsolutePathBuf,
         new_watermark: i64,
         selected_outputs: Vec<codex_state::Stage1Output>,
+        episodic_artifact_memories: Vec<codex_state::Stage1Output>,
         pending_extension_resource_removals: Vec<PendingExtensionResourceRemoval>,
         thread_id: ThreadId,
         agent_control: crate::agent::AgentControl,
@@ -402,6 +413,32 @@ mod agent {
             .await;
 
             if matches!(final_status, AgentStatus::Completed(_)) {
+                match validate_post_consolidation_artifacts(
+                    root.as_path(),
+                    &episodic_artifact_memories,
+                )
+                .await
+                {
+                    Ok(report) if report.is_ok() => {}
+                    Ok(report) => {
+                        tracing::error!(
+                            "phase-2 post-consolidation artifact validation failed for root {}: {:?}",
+                            root.display(),
+                            report.issues
+                        );
+                        job::failed(&session, &db, &claim, "failed_artifact_validation").await;
+                        return;
+                    }
+                    Err(err) => {
+                        tracing::error!(
+                            "phase-2 post-consolidation artifact validation errored for root {}: {err}",
+                            root.display()
+                        );
+                        job::failed(&session, &db, &claim, "failed_artifact_validation").await;
+                        return;
+                    }
+                }
+
                 if let Some(token_usage) = agent_control.get_total_token_usage(thread_id).await {
                     emit_token_usage_metrics(&session, &token_usage);
                 }
